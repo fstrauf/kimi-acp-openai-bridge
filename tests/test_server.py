@@ -30,11 +30,11 @@ def client(test_config):
 
 class TestHealthEndpoint:
     """Test the health endpoint."""
-    
+
     def test_health_check(self, client):
         """Test health check returns expected format."""
         response = client.get("/health")
-        
+
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "healthy"
@@ -44,11 +44,11 @@ class TestHealthEndpoint:
 
 class TestModelsEndpoint:
     """Test the models endpoint."""
-    
+
     def test_list_models(self, client):
         """Test listing models."""
         response = client.get("/v1/models")
-        
+
         assert response.status_code == 200
         data = response.json()
         assert data["object"] == "list"
@@ -58,7 +58,7 @@ class TestModelsEndpoint:
 
 class TestChatCompletions:
     """Test chat completions endpoint."""
-    
+
     def test_invalid_model(self, client):
         """Test that invalid model returns error."""
         response = client.post(
@@ -68,11 +68,12 @@ class TestChatCompletions:
                 "messages": [{"role": "user", "content": "Hello"}],
             },
         )
-        
+
         assert response.status_code == 400
         data = response.json()
-        assert "error" in data
-    
+        # FastAPI wraps HTTPException in 'detail'
+        assert "error" in data.get("detail", {}) or "error" in data
+
     def test_missing_messages(self, client):
         """Test that request without messages fails validation."""
         response = client.post(
@@ -81,9 +82,9 @@ class TestChatCompletions:
                 "model": "kimi-k2.5",
             },
         )
-        
+
         assert response.status_code == 422  # Validation error
-    
+
     def test_valid_request_structure(self, client):
         """Test that valid request is accepted."""
         # Note: This will fail because echo doesn't speak ACP,
@@ -96,7 +97,7 @@ class TestChatCompletions:
                 "stream": False,
             },
         )
-        
+
         # Will fail due to mock, but structure is valid
         # In real usage with proper mock, this would succeed
         assert response.status_code in [200, 503]
@@ -104,7 +105,7 @@ class TestChatCompletions:
 
 class TestRequestValidation:
     """Test request validation."""
-    
+
     def test_stream_parameter(self, client):
         """Test stream parameter is properly parsed."""
         # Valid request (will fail on execution due to mock)
@@ -116,10 +117,10 @@ class TestRequestValidation:
                 "stream": True,
             },
         )
-        
+
         # Should accept the request (may fail on execution)
         assert response.status_code in [200, 503]
-    
+
     def test_tools_parameter(self, client):
         """Test tools parameter is properly parsed."""
         response = client.post(
@@ -139,6 +140,6 @@ class TestRequestValidation:
                 ],
             },
         )
-        
+
         # Should accept the request (may fail on execution)
         assert response.status_code in [200, 503]

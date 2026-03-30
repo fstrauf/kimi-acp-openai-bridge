@@ -49,13 +49,13 @@ def main() -> int:
         action="version",
         version="%(prog)s 0.1.0",
     )
-    
+
     args = parser.parse_args()
-    
+
     # Load configuration
     config_path = args.config
     config = BridgeConfig.load(config_path)
-    
+
     # Override with CLI args
     if args.host:
         config.host = args.host
@@ -65,14 +65,14 @@ def main() -> int:
         config.kimi_binary = args.kimi_binary
     if args.log_level:
         config.log_level = args.log_level
-    
+
     # Create and run the app
     app = create_app(config)
-    
+
     print(f"Starting Kimi ACP Bridge on http://{config.host}:{config.port}")
     print(f"Using Kimi binary: {config.kimi_binary}")
     print(f"Press Ctrl+C to stop")
-    
+
     uvicorn.run(
         app,
         host=config.host,
@@ -80,7 +80,7 @@ def main() -> int:
         log_level=config.log_level.lower(),
         access_log=config.log_level == "DEBUG",
     )
-    
+
     return 0
 
 

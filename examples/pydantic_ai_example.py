@@ -20,11 +20,11 @@ async def basic_chat():
     model = OpenAIModel(
         "kimi-k2.5",
         base_url="http://localhost:8080/v1",
-        api_key="dummy"  # Bridge ignores this
+        api_key="dummy",  # Bridge ignores this
     )
-    
+
     agent = Agent(model)
-    
+
     result = await agent.run("Hello, Kimi! What can you help me with?")
     print("Basic Chat:")
     print(result.data)
@@ -33,17 +33,12 @@ async def basic_chat():
 
 async def with_system_prompt():
     """Chat with system prompt."""
-    model = OpenAIModel(
-        "kimi-k2.5",
-        base_url="http://localhost:8080/v1",
-        api_key="dummy"
-    )
-    
+    model = OpenAIModel("kimi-k2.5", base_url="http://localhost:8080/v1", api_key="dummy")
+
     agent = Agent(
-        model,
-        system_prompt="You are a Rust expert. Provide concise, idiomatic Rust code examples."
+        model, system_prompt="You are a Rust expert. Provide concise, idiomatic Rust code examples."
     )
-    
+
     result = await agent.run("How do I read a file in Rust?")
     print("With System Prompt:")
     print(result.data)
@@ -52,21 +47,18 @@ async def with_system_prompt():
 
 async def with_tools():
     """Chat with tool usage."""
-    model = OpenAIModel(
-        "kimi-k2.5",
-        base_url="http://localhost:8080/v1",
-        api_key="dummy"
-    )
-    
+    model = OpenAIModel("kimi-k2.5", base_url="http://localhost:8080/v1", api_key="dummy")
+
     agent = Agent(model)
-    
+
     # Define a simple tool
     @agent.tool
     async def get_current_time(ctx) -> str:
         """Get the current time."""
         from datetime import datetime
+
         return datetime.now().isoformat()
-    
+
     result = await agent.run("What time is it now?")
     print("With Tools:")
     print(result.data)
@@ -75,19 +67,15 @@ async def with_tools():
 
 async def multi_turn_conversation():
     """Multi-turn conversation."""
-    model = OpenAIModel(
-        "kimi-k2.5",
-        base_url="http://localhost:8080/v1",
-        api_key="dummy"
-    )
-    
+    model = OpenAIModel("kimi-k2.5", base_url="http://localhost:8080/v1", api_key="dummy")
+
     agent = Agent(model)
-    
+
     # First turn
     result1 = await agent.run("My name is Alice.")
     print("Turn 1:")
     print(result1.data)
-    
+
     # Second turn - uses conversation history
     result2 = await agent.run("What's my name?", message_history=result1.all_messages())
     print("\nTurn 2:")
@@ -101,7 +89,7 @@ async def main():
     print("Kimi ACP Bridge + PydanticAI Examples")
     print("=" * 60)
     print()
-    
+
     try:
         await basic_chat()
         await with_system_prompt()

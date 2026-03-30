@@ -56,14 +56,14 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
     """Create and configure the FastAPI application."""
     if config is None:
         config = BridgeConfig.load()
-    
+
     # Configure structlog
     structlog.configure(
         wrapper_class=structlog.make_filtering_bound_logger(
             getattr(__import__("logging"), config.log_level.upper())
         ),
     )
-    
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         """Application lifespan manager."""
@@ -75,14 +75,14 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
         )
         yield
         logger.info("stopping_kimi_acp_bridge")
-    
+
     app = FastAPI(
         title="Kimi ACP Bridge",
         description="OpenAI-compatible API bridge for Kimi ACP",
         version="0.1.0",
         lifespan=lifespan,
     )
-    
+
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
         """Handle unexpected exceptions."""
@@ -97,7 +97,7 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
                 )
             ).model_dump(),
         )
-    
+
     @app.get("/health")
     async def health_check() -> HealthResponse:
         """Health check endpoint."""
@@ -105,7 +105,8 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
         try:
             # Quick check if kimi binary exists
             proc = await asyncio.create_subprocess_exec(
-                config.kimi_binary, "--version",
+                config.kimi_binary,
+                "--version",
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -113,25 +114,25 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
             kimi_available = proc.returncode == 0
         except Exception:
             pass
-        
+
         return HealthResponse(
             status="healthy",
             kimi_available=kimi_available,
             version="0.1.0",
         )
-    
+
     @app.get("/v1/models")
     async def list_models() -> ModelList:
         """List available models."""
         return ModelList(data=AVAILABLE_MODELS)
-    
-    @app.post("/v1/chat/completions")
+
+    @app.post("/v1/chat/completions", response_model=None)
     async def chat_completions(request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
         """OpenAI-compatible chat completions endpoint."""
         start_time = time.time()
         request_id = generate_completion_id()
         created = int(time.time())
-        
+
         logger.info(
             "chat_completion_request",
             request_id=request_id,
@@ -140,7 +141,7 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
             num_messages=len(request.messages),
             has_tools=request.tools is not None,
         )
-        
+
         # Validate model
         model_ids = [m.id for m in AVAILABLE_MODELS]
         if request.model not in model_ids:
@@ -155,49 +156,49 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
                     )
                 ).model_dump(),
             )
-        
+
         # Convert OpenAI messages to ACP format
         preamble, acp_messages = openai_to_acp_messages(request.messages)
-        
+
         # Convert tools if present
         acp_tools = openai_to_acp_tools(request.tools) if request.tools else None
-        
+
         try:
             client = ACPClient(config)
             await client.connect()
-            
+
             session = await client.create_session(
                 preamble=preamble,
                 tools=acp_tools,
             )
-            
+
             if request.stream:
                 # Streaming response
                 async def generate_stream() -> AsyncIterator[str]:
                     completion_id = request_id
                     has_tool_calls = False
-                    
+
                     try:
                         async for event in client.prompt(session, acp_messages, stream=True):
                             event_type = event.get("type", "")
-                            
+
                             # Handle tool calls
                             if event_type == "tool_call.start":
                                 has_tool_calls = True
-                            
+
                             # Convert ACP event to OpenAI chunk
                             chunk = acp_to_openai_chunk(
                                 event, request.model, completion_id, created
                             )
-                            
+
                             if chunk:
                                 data = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
                                 yield data
-                            
+
                             # Check for completion
                             if event_type == "done":
                                 break
-                            
+
                             if event_type == "error":
                                 error_msg = event.get("error", {}).get("message", "Unknown error")
                                 error_chunk = ChatCompletionChunk(
@@ -214,15 +215,17 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
                                 )
                                 yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
                                 break
-                        
+
                         # Send final chunk
                         final_chunk = create_final_chunk(
-                            request.model, completion_id, created,
-                            finish_reason="tool_calls" if has_tool_calls else "stop"
+                            request.model,
+                            completion_id,
+                            created,
+                            finish_reason="tool_calls" if has_tool_calls else "stop",
                         )
                         yield f"data: {final_chunk.model_dump_json(exclude_none=True)}\n\n"
                         yield "data: [DONE]\n\n"
-                        
+
                     finally:
                         await client.close()
                         duration = time.time() - start_time
@@ -232,7 +235,7 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
                             duration_ms=round(duration * 1000, 2),
                             streaming=True,
                         )
-                
+
                 return StreamingResponse(
                     generate_stream(),
                     media_type="text/plain",
@@ -242,17 +245,17 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
                         "Content-Type": "text/event-stream",
                     },
                 )
-            
+
             else:
                 # Non-streaming response
                 full_content = ""
                 tool_calls: list[ToolCall] = []
-                
+
                 async for event in client.prompt(session, acp_messages, stream=False):
                     if event.get("type") == "complete":
                         full_content = event.get("content", "")
                         raw_tool_calls = event.get("tool_calls", [])
-                        
+
                         for tc in raw_tool_calls:
                             tool_calls.append(
                                 ToolCall(
@@ -264,20 +267,20 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
                                 )
                             )
                         break
-                
+
                 await client.close()
-                
+
                 # Build response
                 prompt_text = "\n".join(m.content or "" for m in request.messages)
                 prompt_tokens = estimate_token_count(prompt_text)
                 completion_tokens = estimate_token_count(full_content)
-                
+
                 message = Message(
                     role="assistant",
                     content=full_content if not tool_calls else None,
                     tool_calls=tool_calls if tool_calls else None,
                 )
-                
+
                 response = ChatCompletionResponse(
                     id=request_id,
                     created=created,
@@ -295,7 +298,7 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
                         total_tokens=prompt_tokens + completion_tokens,
                     ),
                 )
-                
+
                 duration = time.time() - start_time
                 logger.info(
                     "chat_completion_complete",
@@ -305,9 +308,9 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                 )
-                
+
                 return JSONResponse(content=response.model_dump(exclude_none=True))
-        
+
         except RuntimeError as e:
             logger.error("kimi_runtime_error", error=str(e))
             raise HTTPException(
@@ -320,7 +323,7 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
                     )
                 ).model_dump(),
             ) from e
-        
+
         except Exception as e:
             logger.error("chat_completion_error", error=str(e))
             raise HTTPException(
@@ -333,5 +336,5 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
                     )
                 ).model_dump(),
             ) from e
-    
+
     return app
