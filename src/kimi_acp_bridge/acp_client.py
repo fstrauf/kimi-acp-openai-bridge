@@ -6,8 +6,9 @@ import asyncio
 import json
 import os
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Callable
+from typing import Any
 
 import structlog
 

@@ -1,14 +1,12 @@
 """Tests for protocol translation."""
 
-import pytest
-
 from kimi_acp_bridge.models import Message, Tool, ToolFunction
 from kimi_acp_bridge.translator import (
+    estimate_token_count,
     generate_completion_id,
     generate_tool_call_id,
     openai_to_acp_messages,
     openai_to_acp_tools,
-    estimate_token_count,
 )
 
 

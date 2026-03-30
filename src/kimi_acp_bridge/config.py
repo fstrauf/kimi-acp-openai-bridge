@@ -12,10 +12,7 @@ import yaml
 
 def _get_config_dir() -> Path:
     """Get the configuration directory."""
-    if os.name == "nt":  # Windows
-        base_dir = Path(os.environ.get("APPDATA", "~"))
-    else:  # Unix/Linux/macOS
-        base_dir = Path.home() / ".config"
+    base_dir = Path(os.environ.get("APPDATA", "~")) if os.name == "nt" else Path.home() / ".config"
     return base_dir / "kimi-acp-bridge"
 
 

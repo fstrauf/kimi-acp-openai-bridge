@@ -1,10 +1,5 @@
 """Tests for configuration."""
 
-import os
-from pathlib import Path
-
-import pytest
-
 from kimi_acp_bridge.config import BridgeConfig
 
 

@@ -71,7 +71,7 @@ def main() -> int:
 
     print(f"Starting Kimi ACP Bridge on http://{config.host}:{config.port}")
     print(f"Using Kimi binary: {config.kimi_binary}")
-    print(f"Press Ctrl+C to stop")
+    print("Press Ctrl+C to stop")
 
     uvicorn.run(
         app,

@@ -8,9 +8,9 @@ __version__ = "0.1.0"
 
 from kimi_acp_bridge.config import BridgeConfig
 from kimi_acp_bridge.models import (
+    ChatCompletionChunk,
     ChatCompletionRequest,
     ChatCompletionResponse,
-    ChatCompletionChunk,
     Message,
     Tool,
     ToolCall,

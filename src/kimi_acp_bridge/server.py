@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
 
 import structlog
 from fastapi import FastAPI, HTTPException, Request
@@ -200,7 +200,6 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
                                 break
 
                             if event_type == "error":
-                                error_msg = event.get("error", {}).get("message", "Unknown error")
                                 error_chunk = ChatCompletionChunk(
                                     id=completion_id,
                                     created=created,
