@@ -1,4 +1,4 @@
-"""ACP client for communicating with Kimi CLI."""
+"""ACP client for communicating with Kimi CLI using official ACP protocol."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from typing import Any
 import structlog
 
 from kimi_acp_bridge.config import BridgeConfig
-from kimi_acp_bridge.translator import generate_completion_id
 
 logger = structlog.get_logger()
 
@@ -27,16 +26,8 @@ class ACPSession:
     tools: list[dict[str, Any]] = field(default_factory=list)
 
 
-@dataclass
-class ACPMessageEvent:
-    """ACP message event."""
-
-    type: str
-    data: dict[str, Any] = field(default_factory=dict)
-
-
 class ACPClient:
-    """Client for communicating with Kimi ACP process."""
+    """Client for communicating with Kimi ACP process using JSON-RPC over stdio."""
 
     def __init__(self, config: BridgeConfig):
         self.config = config
@@ -70,16 +61,12 @@ class ACPClient:
                     },
                 )
 
-                # Send initialize request
+                # Send initialize request per ACP spec
                 await self._send_request(
                     "initialize",
                     {
                         "protocolVersion": 1,
-                        "capabilities": {
-                            "tools": {"listChanged": False},
-                            "prompts": {},
-                            "resources": {},
-                        },
+                        "capabilities": {},
                         "clientInfo": {
                             "name": "kimi-acp-bridge",
                             "version": "0.1.0",
@@ -113,12 +100,31 @@ class ACPClient:
         self,
         preamble: str | None = None,
         tools: list[dict[str, Any]] | None = None,
+        cwd: str | None = None,
     ) -> ACPSession:
-        """Create a new ACP session."""
+        """Create a new ACP session using session/new method."""
         if self.process is None:
             await self.connect()
 
-        session_id = str(uuid.uuid4())
+        # Use ACP session/new method
+        import os
+
+        params: dict[str, Any] = {
+            "cwd": cwd or os.getcwd(),
+            "mcpServers": [],  # No MCP servers for now
+        }
+        if preamble:
+            params["preamble"] = preamble
+
+        await self._send_request("session/new", params)
+
+        response = await self._read_response()
+        result = response.get("result", {})
+
+        if "error" in response:
+            raise RuntimeError(f"Failed to create session: {response['error']}")
+
+        session_id = result.get("sessionId", str(uuid.uuid4()))
         self._session = ACPSession(
             session_id=session_id,
             preamble=preamble,
@@ -134,7 +140,7 @@ class ACPClient:
         messages: list[dict[str, Any]],
         stream: bool = True,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Send a prompt and yield events.
+        """Send a prompt using session/prompt and yield session/update events.
 
         Args:
             session: The ACP session
@@ -147,58 +153,117 @@ class ACPClient:
         if self.process is None or self.process.stdin is None or self.process.stdout is None:
             raise RuntimeError("ACP client not connected")
 
-        # Build the request
-        request_params: dict[str, Any] = {
-            "messages": messages,
-        }
+        # Build prompt text from messages
+        prompt_text = ""
+        for msg in messages:
+            if msg.get("role") == "user":
+                prompt_text = msg.get("content", "")
+                break
 
-        if session.preamble:
-            request_params["system"] = session.preamble
+        # Send session/prompt request - prompt is a list of content items
+        await self._send_request(
+            "session/prompt",
+            {
+                "sessionId": session.session_id,
+                "prompt": [{"type": "text", "text": prompt_text}],
+            },
+        )
 
-        if session.tools and self.config.enable_tools:
-            request_params["tools"] = session.tools
+        # Collect all streaming events
+        full_content = ""
+        tool_calls: list[dict[str, Any]] = []
 
-        # Send the prompt request
-        await self._send_request("prompt", request_params)
+        # Read events until done or timeout
+        while True:
+            try:
+                # Read raw message (could be response or notification)
+                line = await asyncio.wait_for(
+                    self.process.stdout.readline(),
+                    timeout=self.config.session_timeout,
+                )
 
-        # Read responses until done
-        if stream:
-            async for event in self._stream_events():
-                yield event
-        else:
-            # Non-streaming: collect all content
-            full_content = ""
-            tool_calls: list[dict[str, Any]] = []
-            current_tool_call: dict[str, Any] | None = None
-
-            async for event in self._stream_events():
-                event_type = event.get("type", "")
-
-                if event_type == "message.delta":
-                    full_content += event.get("delta", "")
-
-                elif event_type == "tool_call.start":
-                    tc_data = event.get("tool_call", {})
-                    current_tool_call = {
-                        "id": tc_data.get("id", generate_completion_id()),
-                        "type": "function",
-                        "function": {
-                            "name": tc_data.get("name", ""),
-                            "arguments": "",
-                        },
-                    }
-
-                elif event_type == "tool_call.delta" and current_tool_call:
-                    current_tool_call["function"]["arguments"] += event.get("delta", "")
-
-                elif event_type == "tool_call.complete" and current_tool_call:
-                    tool_calls.append(current_tool_call)
-                    current_tool_call = None
-
-                elif event_type == "done":
+                if not line:
+                    logger.warning("acp_stdout_eof")
                     break
 
-            # Yield final response
+                event = json.loads(line.decode("utf-8", errors="replace"))
+
+                if self.config.log_acp_messages:
+                    logger.debug("acp_event", message=event)
+
+                # Handle notifications (no id, has method)
+                if "id" not in event and "method" in event:
+                    method = event.get("method", "")
+                    params = event.get("params", {})
+
+                    if method == "session/update":
+                        update = params.get("update", {})
+                        update_type = update.get("sessionUpdate", "")
+
+                        if update_type == "agent_message_chunk":
+                            chunk = update.get("content", {}).get("text", "")
+                            full_content += chunk
+                            if stream:
+                                yield {"type": "message.delta", "delta": chunk}
+
+                        elif update_type == "agent_thought_chunk":
+                            # Log reasoning but don't include in output
+                            pass
+
+                        elif update_type == "available_commands_update":
+                            # Ignore available commands update
+                            pass
+
+                        elif update_type == "tool_call":
+                            tool_call = {
+                                "id": update.get("toolCallId", ""),
+                                "name": update.get("toolName", ""),
+                                "arguments": json.dumps(update.get("arguments", {})),
+                            }
+                            tool_calls.append(tool_call)
+                            if stream:
+                                yield {
+                                    "type": "tool_call.start",
+                                    "tool_call": tool_call,
+                                }
+
+                        elif update_type == "tool_result":
+                            if stream:
+                                yield {
+                                    "type": "tool_result",
+                                    "result": update.get("result", {}),
+                                }
+
+                        elif update_type == "done":
+                            if stream:
+                                yield {"type": "done"}
+                            break
+
+                # Handle response to our prompt request (has matching id)
+                elif event.get("id") == self._message_id:
+                    if event.get("error"):
+                        raise RuntimeError(f"Prompt failed: {event['error']}")
+                    # Continue reading for notifications
+
+                # Handle other responses
+                elif "id" in event:
+                    # Response to some other request, skip
+                    pass
+
+            except asyncio.TimeoutError:
+                logger.error("acp_read_timeout")
+                yield {"type": "error", "error": {"message": "Session timeout"}}
+                break
+            except json.JSONDecodeError as e:
+                logger.error("acp_json_error", error=str(e))
+                continue
+            except Exception as e:
+                logger.error("acp_read_error", error=str(e))
+                yield {"type": "error", "error": {"message": str(e)}}
+                break
+
+        # Final yield for non-streaming
+        if not stream:
             yield {
                 "type": "complete",
                 "content": full_content,
@@ -321,7 +386,7 @@ class ACPClient:
             try:
                 return json.loads(buffer)  # type: ignore[no-any-return]
             except json.JSONDecodeError:
-                continue
+                continue  # Incomplete, read more
 
     async def close(self) -> None:
         """Clean up resources."""
