@@ -243,7 +243,13 @@ class ACPClient:
                 elif event.get("id") == self._message_id:
                     if event.get("error"):
                         raise RuntimeError(f"Prompt failed: {event['error']}")
-                    # Continue reading for notifications
+                    # Got final result - signal completion
+                    result = event.get("result", {})
+                    if result.get("stopReason") == "end_turn":
+                        if stream:
+                            yield {"type": "done"}
+                        break
+                    # Continue reading for more notifications if needed
 
                 # Handle other responses
                 elif "id" in event:
