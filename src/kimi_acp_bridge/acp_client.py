@@ -74,7 +74,7 @@ class ACPClient:
                 await self._send_request(
                     "initialize",
                     {
-                        "protocolVersion": "2024-11-05",
+                        "protocolVersion": 1,
                         "capabilities": {
                             "tools": {"listChanged": False},
                             "prompts": {},
