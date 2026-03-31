@@ -11,7 +11,7 @@ class TestBridgeConfig:
         config = BridgeConfig()
 
         assert config.kimi_binary == "kimi"
-        assert config.kimi_args == ["acp", "--stdio"]
+        assert config.kimi_args == ["acp"]
         assert config.host == "127.0.0.1"
         assert config.port == 8080
         assert config.session_mode == "ephemeral"
@@ -46,7 +46,7 @@ server:
 
 kimi:
   binary: /usr/bin/kimi
-  args: ["acp", "--stdio", "--verbose"]
+  args: ["acp", "--verbose"]
 
 session:
   mode: ephemeral
@@ -66,7 +66,7 @@ logging:
         assert config.host == "0.0.0.0"
         assert config.port == 9000
         assert config.kimi_binary == "/usr/bin/kimi"
-        assert config.kimi_args == ["acp", "--stdio", "--verbose"]
+        assert config.kimi_args == ["acp", "--verbose"]
         assert config.session_timeout == 600
         assert config.enable_tools is False
         assert config.auto_approve_tools is False

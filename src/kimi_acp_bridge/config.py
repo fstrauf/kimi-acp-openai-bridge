@@ -44,7 +44,7 @@ class BridgeConfig:
 
     # Kimi CLI settings
     kimi_binary: str = "kimi"
-    kimi_args: list[str] = field(default_factory=lambda: ["acp", "--stdio"])
+    kimi_args: list[str] = field(default_factory=lambda: ["acp"])
 
     # Server settings
     host: str = "127.0.0.1"
@@ -68,7 +68,7 @@ class BridgeConfig:
         """Create configuration from environment variables."""
         return cls(
             kimi_binary=os.getenv("KIMI_BINARY", "kimi"),
-            kimi_args=os.getenv("KIMI_ARGS", "acp --stdio").split(),
+            kimi_args=os.getenv("KIMI_ARGS", "acp").split(),
             host=os.getenv("KIMI_BRIDGE_HOST", "127.0.0.1"),
             port=int(os.getenv("KIMI_BRIDGE_PORT", "8080")),
             session_mode=os.getenv("KIMI_BRIDGE_SESSION_MODE", "ephemeral"),  # type: ignore[arg-type]

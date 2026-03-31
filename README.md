@@ -137,7 +137,7 @@ server:
 
 kimi:
   binary: /usr/local/bin/kimi
-  args: ["acp", "--stdio"]
+  args: ["acp"]
   
 session:
   mode: ephemeral
@@ -220,11 +220,11 @@ Health check endpoint.
 │  │ Server   │ │ ACP      │ │ Manager  │ │ OpenAI   │           │
 │  └──────────┘ └──────────┘ └──────────┘ └──────────┘           │
 └─────────────────────────────┬───────────────────────────────────┘
-                              │ JSON-RPC 2.0 over stdio
+                              │ HTTP/WebSocket to Kimi ACP
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                         KIMI CODE CLI                            │
-│                      (kimi acp --stdio)                          │
+│                      (kimi acp)                          │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
