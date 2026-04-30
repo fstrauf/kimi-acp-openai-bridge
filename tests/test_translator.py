@@ -1,10 +1,11 @@
 """Tests for protocol translation."""
 
-from kimi_acp_bridge.models import Message, Tool, ToolFunction
+from kimi_acp_bridge.models import Message, ResponseFormat, Tool, ToolFunction
 from kimi_acp_bridge.translator import (
     estimate_token_count,
     generate_completion_id,
     generate_tool_call_id,
+    inject_response_format_to_prompt,
     openai_to_acp_messages,
     openai_to_acp_tools,
 )
@@ -211,3 +212,82 @@ class TestACPToOpenAI:
         for event in control_events:
             chunk = acp_to_openai_chunk(event, "kimi-k2.5", "chatcmpl-123", 1234567890)
             assert chunk is None
+
+
+class TestResponseFormatInjection:
+    """Test response format injection for structured output."""
+
+    def test_inject_json_object_format(self):
+        """Test injecting json_object constraints into preamble."""
+        rf = ResponseFormat(type="json_object")
+        result = inject_response_format_to_prompt("You are helpful.", rf)
+
+        assert "You are helpful." in result
+        assert "valid JSON only" in result
+        assert "prose" in result.lower() or "markdown" in result.lower()
+
+    def test_inject_json_schema_format(self):
+        """Test injecting json_schema constraints into preamble."""
+        rf = ResponseFormat(
+            type="json_schema",
+            json_schema={
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        )
+        result = inject_response_format_to_prompt("You are helpful.", rf)
+
+        assert "You are helpful." in result
+        assert "schema" in result.lower()
+        assert "name" in result
+        assert "Return ONLY the JSON" in result
+
+    def test_inject_with_schema_description(self):
+        """Test that schema description is included if present."""
+        rf = ResponseFormat(
+            type="json_schema",
+            json_schema={
+                "type": "object",
+                "description": "A person object",
+                "properties": {"name": {"type": "string"}},
+            },
+        )
+        result = inject_response_format_to_prompt(None, rf)
+
+        assert "A person object" in result
+        assert "schema" in result.lower()
+
+    def test_inject_no_preamble_creates_new(self):
+        """Test that response format works even without existing preamble."""
+        rf = ResponseFormat(type="json_object")
+        result = inject_response_format_to_prompt(None, rf)
+
+        assert result is not None
+        assert "valid JSON only" in result
+
+    def test_no_response_format_returns_preamble_unchanged(self):
+        """Test that None response_format returns preamble unchanged."""
+        result = inject_response_format_to_prompt("You are helpful.", None)
+        assert result == "You are helpful."
+
+    def test_text_response_format_returns_preamble_unchanged(self):
+        """Test that 'text' response_format returns preamble unchanged."""
+        rf = ResponseFormat(type="text")
+        result = inject_response_format_to_prompt("You are helpful.", rf)
+        assert result == "You are helpful."
+
+    def test_openai_to_acp_with_response_format(self):
+        """Test that openai_to_acp_messages includes response format in preamble."""
+        messages = [
+            Message(role="system", content="You are a helpful assistant."),
+            Message(role="user", content="Hello!"),
+        ]
+        rf = ResponseFormat(type="json_object")
+
+        preamble, acp_messages = openai_to_acp_messages(messages, response_format=rf)
+
+        assert "You are a helpful assistant." in preamble
+        assert "valid JSON only" in preamble
+        assert len(acp_messages) == 1
+        assert acp_messages[0]["role"] == "user"

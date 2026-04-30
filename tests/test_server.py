@@ -100,6 +100,66 @@ class TestChatCompletions:
         # In real usage with proper mock, this would succeed
         assert response.status_code in [200, 503]
 
+    def test_direct_backend_returns_completion(self):
+        """Test direct backend returns an OpenAI-compatible completion."""
+        config = BridgeConfig(
+            kimi_backend="direct",
+            kimi_binary="echo",
+            host="127.0.0.1",
+            port=8080,
+            log_level="DEBUG",
+        )
+        client = TestClient(create_app(config))
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "kimi-k2.5",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": False,
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["object"] == "chat.completion"
+        assert data["choices"][0]["message"]["role"] == "assistant"
+        assert "User: Hello" in data["choices"][0]["message"]["content"]
+        assert data["usage"]["total_tokens"] >= 1
+
+    def test_direct_backend_rejects_tools(self):
+        """Test direct backend rejects native tool calls with a clear error."""
+        config = BridgeConfig(
+            kimi_backend="direct",
+            kimi_binary="echo",
+            host="127.0.0.1",
+            port=8080,
+            log_level="DEBUG",
+        )
+        client = TestClient(create_app(config))
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "kimi-k2.5",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "test",
+                            "description": "Test function",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+            },
+        )
+
+        assert response.status_code == 400
+        data = response.json()
+        assert data["detail"]["error"]["code"] == "tools_not_supported"
+
 
 class TestRequestValidation:
     """Test request validation."""
@@ -113,6 +173,65 @@ class TestRequestValidation:
                 "model": "kimi-k2.5",
                 "messages": [{"role": "user", "content": "Hi"}],
                 "stream": True,
+            },
+        )
+
+        # Should accept the request (may fail on execution)
+        assert response.status_code in [200, 503]
+
+    def test_tool_choice_none_strips_tools(self, client):
+        """Test that tool_choice: none is accepted and strips tools."""
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "kimi-k2.5",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "test",
+                            "description": "Test function",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+                "tool_choice": "none",
+            },
+        )
+
+        # Should accept the request (may fail on execution)
+        assert response.status_code in [200, 503]
+
+    def test_response_format_json_object(self, client):
+        """Test that response_format with json_object is accepted."""
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "kimi-k2.5",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "response_format": {"type": "json_object"},
+            },
+        )
+
+        # Should accept the request (may fail on execution)
+        assert response.status_code in [200, 503]
+
+    def test_response_format_json_schema(self, client):
+        """Test that response_format with json_schema is accepted."""
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "kimi-k2.5",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"],
+                    },
+                },
             },
         )
 

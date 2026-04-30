@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from kimi_acp_bridge.models import ResponseFormat
 
 from kimi_acp_bridge.models import (
     ChatCompletionChunk,
@@ -43,19 +47,77 @@ def generate_tool_call_id() -> str:
     return f"call_{uuid.uuid4().hex[:24]}"
 
 
-def openai_to_acp_messages(messages: list[Message]) -> tuple[str | None, list[dict[str, Any]]]:
+def inject_response_format_to_prompt(
+    preamble: str | None,
+    response_format: "ResponseFormat | None",
+) -> str | None:
+    """Inject JSON schema constraints into the system prompt.
+
+    This enables structured output (Extractor<T>) support for Rig and similar frameworks.
+    Kimi ACP doesn't natively support response_format, so we inject constraints via prompt.
+    """
+    if response_format is None or response_format.type == "text":
+        return preamble
+
+    constraints_parts: list[str] = []
+
+    if response_format.type == "json_object":
+        constraints_parts.append(
+            "You must respond with valid JSON only. "
+            "Do not include any prose, explanations, markdown formatting, or code fences. "
+            "Return only the raw JSON object."
+        )
+
+    elif response_format.type == "json_schema" and response_format.json_schema:
+        schema = response_format.json_schema
+        schema_json = json.dumps(schema, indent=2)
+
+        constraints_parts.append(
+            "You must respond with valid JSON that conforms to the following schema:\n"
+            f"```json\n{schema_json}\n```\n\n"
+            "Requirements:\n"
+            "- Return ONLY the JSON object, no markdown, no code fences, no explanations\n"
+            "- Ensure all required fields are present\n"
+            "- Use the exact field names and types specified in the schema\n"
+            "- Do not include any additional fields not in the schema"
+        )
+
+        # If schema has a description, include it
+        if schema.get("description"):
+            constraints_parts.insert(
+                0,
+                f"Response description: {schema['description']}"
+            )
+
+    constraints = "\n\n".join(constraints_parts)
+
+    if preamble:
+        return f"{preamble}\n\n{constraints}"
+    else:
+        return constraints
+
+
+def openai_to_acp_messages(
+    messages: list[Message],
+    response_format: "ResponseFormat | None" = None,
+) -> tuple[str | None, list[dict[str, Any]]]:
     """Convert OpenAI messages to ACP format.
+
+    Args:
+        messages: OpenAI format messages
+        response_format: Optional response format for structured output
 
     Returns:
         Tuple of (system_preamble, acp_messages)
     """
-    preamble = None
+    preamble_parts: list[str] = []
     acp_messages = []
 
     for msg in messages:
         if msg.role == "system":
-            # Extract system message as preamble
-            preamble = msg.content
+            # Collect all system messages as preamble
+            if msg.content:
+                preamble_parts.append(msg.content)
         elif msg.role == "tool":
             # Tool result message
             acp_messages.append(
@@ -92,6 +154,12 @@ def openai_to_acp_messages(messages: list[Message]) -> tuple[str | None, list[di
                     "content": msg.content or "",
                 }
             )
+
+    preamble = "\n\n".join(preamble_parts) if preamble_parts else None
+
+    # Inject response format constraints into preamble
+    if response_format is not None:
+        preamble = inject_response_format_to_prompt(preamble, response_format)
 
     return preamble, acp_messages
 

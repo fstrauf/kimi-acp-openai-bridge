@@ -120,6 +120,7 @@ curl http://localhost:8080/v1/chat/completions \
 |----------|---------|-------------|
 | `KIMI_BRIDGE_HOST` | `127.0.0.1` | Server bind address |
 | `KIMI_BRIDGE_PORT` | `8080` | Server port |
+| `KIMI_BRIDGE_BACKEND` | `acp` | Kimi execution backend: `acp` or `direct` |
 | `KIMI_BINARY` | `kimi` | Path to kimi CLI binary |
 | `KIMI_BRIDGE_SESSION_MODE` | `ephemeral` | Session persistence mode |
 | `KIMI_BRIDGE_AUTO_APPROVE` | `true` | Auto-approve tool calls |
@@ -136,6 +137,7 @@ server:
   port: 8080
 
 kimi:
+  backend: acp
   binary: /usr/local/bin/kimi
   args: ["acp"]
   

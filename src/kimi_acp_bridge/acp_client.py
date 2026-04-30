@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -29,8 +30,9 @@ class ACPSession:
 class ACPClient:
     """Client for communicating with Kimi ACP process using JSON-RPC over stdio."""
 
-    def __init__(self, config: BridgeConfig):
+    def __init__(self, config: BridgeConfig, request_id: str | None = None):
         self.config = config
+        self.request_id = request_id
         self.process: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
         self._session: ACPSession | None = None
@@ -44,21 +46,27 @@ class ACPClient:
 
             logger.info(
                 "spawning_kimi_process",
+                request_id=self.request_id,
                 binary=self.config.kimi_binary,
                 args=self.config.kimi_args,
             )
 
             try:
+                connect_start = time.perf_counter()
                 self.process = await asyncio.create_subprocess_exec(
                     self.config.kimi_binary,
                     *self.config.kimi_args,
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE if self.config.log_acp_messages else None,
-                    env={
-                        **os.environ,
-                        "KIMI_AUTO_APPROVE": "true" if self.config.auto_approve_tools else "false",
-                    },
+                    env=dict(os.environ),
+                )
+                spawn_ms = round((time.perf_counter() - connect_start) * 1000, 2)
+                logger.info(
+                    "kimi_process_spawned",
+                    request_id=self.request_id,
+                    pid=self.process.pid,
+                    duration_ms=spawn_ms,
                 )
 
                 # Send initialize request per ACP spec
@@ -77,7 +85,11 @@ class ACPClient:
                 # Wait for initialize response
                 response = await self._read_response()
                 if response.get("result"):
-                    logger.info("acp_initialized")
+                    logger.info(
+                        "acp_initialized",
+                        request_id=self.request_id,
+                        duration_ms=round((time.perf_counter() - connect_start) * 1000, 2),
+                    )
                 else:
                     error = response.get("error", {})
                     raise RuntimeError(f"ACP initialization failed: {error}")
@@ -86,15 +98,21 @@ class ACPClient:
                 await self._send_notification("initialized", {})
 
             except FileNotFoundError as e:
-                logger.error("kimi_binary_not_found", binary=self.config.kimi_binary)
+                logger.error(
+                    "kimi_binary_not_found",
+                    request_id=self.request_id,
+                    binary=self.config.kimi_binary,
+                )
                 raise RuntimeError(
                     f"Kimi CLI not found at '{self.config.kimi_binary}'. "
                     "Please ensure Kimi CLI is installed and in PATH."
                 ) from e
             except Exception as e:
-                logger.error("failed_to_spawn_kimi", error=str(e))
+                logger.error("failed_to_spawn_kimi", request_id=self.request_id, error=str(e))
                 await self.close()
-                raise
+                if isinstance(e, RuntimeError):
+                    raise
+                raise RuntimeError(f"Failed to start Kimi ACP process: {e}") from e
 
     async def create_session(
         self,
@@ -107,15 +125,16 @@ class ACPClient:
             await self.connect()
 
         # Use ACP session/new method
-        import os
-
         params: dict[str, Any] = {
             "cwd": cwd or os.getcwd(),
             "mcpServers": [],  # No MCP servers for now
         }
+        # preamble is accepted by the bridge but currently ignored by Kimi ACP.
+        # We include it for forward-compatibility and also prepend it to prompts.
         if preamble:
             params["preamble"] = preamble
 
+        session_start = time.perf_counter()
         await self._send_request("session/new", params)
 
         response = await self._read_response()
@@ -131,14 +150,61 @@ class ACPClient:
             tools=tools or [],
         )
 
-        logger.debug("session_created", session_id=session_id)
+        logger.info(
+            "session_created",
+            request_id=self.request_id,
+            session_id=session_id,
+            duration_ms=round((time.perf_counter() - session_start) * 1000, 2),
+            preamble_bytes=len((preamble or "").encode("utf-8")),
+            tools_count=len(tools or []),
+        )
         return self._session
+
+    def _build_prompt_text(self, session: ACPSession, messages: list[dict[str, Any]]) -> str:
+        """Build a single prompt text from the message history.
+
+        Kimi ACP's session/prompt only accepts the current user turn, and
+        session/new ignores preamble. We therefore fold the system message
+        and any prior turns into one text block so the model sees the full
+        context.
+        """
+        parts: list[str] = []
+
+        if session.preamble:
+            parts.append(f"System: {session.preamble}")
+
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            if role == "system":
+                # Already handled as preamble, but include any additional system msgs
+                parts.append(f"System: {content}")
+            elif role == "user":
+                parts.append(f"User: {content}")
+            elif role == "assistant":
+                tool_calls = msg.get("tool_calls")
+                if tool_calls:
+                    tc_parts = []
+                    for tc in tool_calls:
+                        fn = tc.get("function", {})
+                        name = fn.get("name", "")
+                        arguments = fn.get("arguments", "")
+                        tc_parts.append(f"<tool_call>{name}({arguments})</tool_call>")
+                    parts.append(f"Assistant: {''.join(tc_parts)}")
+                else:
+                    parts.append(f"Assistant: {content}")
+            elif role == "tool_result":
+                parts.append(f"Tool result: {content}")
+
+        return "\n\n".join(parts)
 
     async def prompt(
         self,
         session: ACPSession,
         messages: list[dict[str, Any]],
         stream: bool = True,
+        enable_native_tools: bool = True,
     ) -> AsyncIterator[dict[str, Any]]:
         """Send a prompt using session/prompt and yield session/update events.
 
@@ -146,6 +212,10 @@ class ACPClient:
             session: The ACP session
             messages: List of messages (already converted to ACP format)
             stream: Whether to stream responses
+            enable_native_tools: If False, native ACP tool_call notifications are
+                converted to text deltas instead of OpenAI tool_call events. This
+                prevents Kimi from returning empty tool_calls when the client is
+                doing prompt-based tool calling.
 
         Yields:
             ACP events as dictionaries
@@ -153,12 +223,18 @@ class ACPClient:
         if self.process is None or self.process.stdin is None or self.process.stdout is None:
             raise RuntimeError("ACP client not connected")
 
-        # Build prompt text from messages
-        prompt_text = ""
-        for msg in messages:
-            if msg.get("role") == "user":
-                prompt_text = msg.get("content", "")
-                break
+        prompt_text = self._build_prompt_text(session, messages)
+        prompt_start = time.perf_counter()
+
+        logger.info(
+            "acp_prompt_prepared",
+            request_id=self.request_id,
+            session_id=session.session_id,
+            message_count=len(messages),
+            prompt_bytes=len(prompt_text.encode("utf-8")),
+            stream=stream,
+            enable_native_tools=enable_native_tools,
+        )
 
         # Send session/prompt request - prompt is a list of content items
         await self._send_request(
@@ -168,10 +244,20 @@ class ACPClient:
                 "prompt": [{"type": "text", "text": prompt_text}],
             },
         )
+        logger.info(
+            "acp_prompt_sent",
+            request_id=self.request_id,
+            session_id=session.session_id,
+            duration_ms=round((time.perf_counter() - prompt_start) * 1000, 2),
+        )
 
         # Collect all streaming events
         full_content = ""
         tool_calls: list[dict[str, Any]] = []
+        buffer = ""
+        events_seen = 0
+        first_event_logged = False
+        first_content_logged = False
 
         # Read events until done or timeout
         while True:
@@ -186,10 +272,40 @@ class ACPClient:
                     logger.warning("acp_stdout_eof")
                     break
 
-                event = json.loads(line.decode("utf-8", errors="replace"))
+                buffer += line.decode("utf-8", errors="replace")
+
+                try:
+                    event = json.loads(buffer)
+                except json.JSONDecodeError:
+                    # Incomplete JSON, wait for more data
+                    continue
+
+                buffer = ""  # Successfully parsed
 
                 if self.config.log_acp_messages:
                     logger.debug("acp_event", message=event)
+
+                events_seen += 1
+                if not first_event_logged:
+                    first_event_logged = True
+                    update_type = ""
+                    if event.get("method") == "session/update":
+                        update_type = (
+                            event.get("params", {}).get("update", {}).get("sessionUpdate", "")
+                        )
+                    logger.info(
+                        "acp_first_event_received",
+                        request_id=self.request_id,
+                        session_id=session.session_id,
+                        duration_ms=round((time.perf_counter() - prompt_start) * 1000, 2),
+                        method=event.get("method", ""),
+                        update_type=update_type,
+                    )
+
+                # Handle incoming requests from the ACP server (has both id and method)
+                if "id" in event and "method" in event:
+                    await self._handle_incoming_request(event)
+                    continue
 
                 # Handle notifications (no id, has method)
                 if "id" not in event and "method" in event:
@@ -202,6 +318,17 @@ class ACPClient:
 
                         if update_type == "agent_message_chunk":
                             chunk = update.get("content", {}).get("text", "")
+                            if chunk and not first_content_logged:
+                                first_content_logged = True
+                                logger.info(
+                                    "acp_first_content_chunk",
+                                    request_id=self.request_id,
+                                    session_id=session.session_id,
+                                    duration_ms=round(
+                                        (time.perf_counter() - prompt_start) * 1000, 2
+                                    ),
+                                    chunk_chars=len(chunk),
+                                )
                             full_content += chunk
                             if stream:
                                 yield {"type": "message.delta", "delta": chunk}
@@ -214,21 +341,44 @@ class ACPClient:
                             # Ignore available commands update
                             pass
 
+                        elif update_type == "plan":
+                            # Ignore plan updates
+                            pass
+
                         elif update_type == "tool_call":
                             tool_call = {
                                 "id": update.get("toolCallId", ""),
                                 "name": update.get("toolName", ""),
                                 "arguments": json.dumps(update.get("arguments", {})),
                             }
-                            tool_calls.append(tool_call)
-                            if stream:
+                            if enable_native_tools:
+                                tool_calls.append(tool_call)
+                                if stream:
+                                    yield {
+                                        "type": "tool_call.start",
+                                        "tool_call": tool_call,
+                                    }
+                            else:
+                                # Fold native tool call back into text for prompt-based usage
+                                text = (
+                                    f"<tool_call>{tool_call['name']}"
+                                    f"({tool_call['arguments']})</tool_call>"
+                                )
+                                full_content += text
+                                if stream:
+                                    yield {"type": "message.delta", "delta": text}
+
+                        elif update_type == "tool_call_update":
+                            status = update.get("status", "")
+                            if status in ("completed", "failed") and enable_native_tools and stream:
                                 yield {
-                                    "type": "tool_call.start",
-                                    "tool_call": tool_call,
+                                    "type": "tool_result",
+                                    "result": update.get("result", {}),
                                 }
 
                         elif update_type == "tool_result":
-                            if stream:
+                            # Legacy handling – kept for compatibility
+                            if enable_native_tools and stream:
                                 yield {
                                     "type": "tool_result",
                                     "result": update.get("result", {}),
@@ -244,12 +394,9 @@ class ACPClient:
                     if event.get("error"):
                         raise RuntimeError(f"Prompt failed: {event['error']}")
                     # Got final result - signal completion
-                    result = event.get("result", {})
-                    if result.get("stopReason") == "end_turn":
-                        if stream:
-                            yield {"type": "done"}
-                        break
-                    # Continue reading for more notifications if needed
+                    if stream:
+                        yield {"type": "done"}
+                    break
 
                 # Handle other responses
                 elif "id" in event:
@@ -262,11 +409,22 @@ class ACPClient:
                 break
             except json.JSONDecodeError as e:
                 logger.error("acp_json_error", error=str(e))
+                buffer = ""
                 continue
             except Exception as e:
                 logger.error("acp_read_error", error=str(e))
                 yield {"type": "error", "error": {"message": str(e)}}
                 break
+
+        logger.info(
+            "acp_prompt_finished",
+            request_id=self.request_id,
+            session_id=session.session_id,
+            duration_ms=round((time.perf_counter() - prompt_start) * 1000, 2),
+            events_seen=events_seen,
+            content_chars=len(full_content),
+            tool_calls_count=len(tool_calls),
+        )
 
         # Final yield for non-streaming
         if not stream:
@@ -275,6 +433,83 @@ class ACPClient:
                 "content": full_content,
                 "tool_calls": tool_calls,
             }
+
+    async def _handle_incoming_request(self, event: dict[str, Any]) -> None:
+        """Handle JSON-RPC requests sent from the ACP server to us."""
+        method = event.get("method", "")
+        request_id = event.get("id")
+
+        logger.debug("acp_incoming_request", method=method, request_id=request_id)
+
+        if method == "session/request_permission":
+            # Auto-approve all permission requests to prevent deadlocks.
+            await self._send_response(
+                request_id,
+                {
+                    "outcome": {
+                        "outcome": "selected",
+                        "option_id": "approve",
+                    }
+                },
+            )
+            logger.debug("auto_approved_permission_request", request_id=request_id)
+            return
+
+        if method in (
+            "terminal/create",
+            "terminal/output",
+            "terminal/wait_for_exit",
+            "terminal/kill",
+            "terminal/release",
+            "fs/read_text_file",
+            "fs/write_text_file",
+        ):
+            logger.warning("acp_method_not_supported", method=method)
+            await self._send_response(
+                request_id,
+                error={
+                    "code": -32601,
+                    "message": f"Method {method} is not supported by the bridge",
+                },
+            )
+            return
+
+        # Unknown method
+        logger.warning("acp_unknown_method", method=method)
+        await self._send_response(
+            request_id,
+            error={
+                "code": -32601,
+                "message": f"Method {method} not found",
+            },
+        )
+
+    async def _send_response(
+        self,
+        request_id: Any,
+        result: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> None:
+        """Send a JSON-RPC response."""
+        if self.process is None or self.process.stdin is None:
+            raise RuntimeError("Not connected")
+
+        response: dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+        }
+        if error is not None:
+            response["error"] = error
+        else:
+            response["result"] = result or {}
+
+        data = json.dumps(response) + "\n"
+
+        if self.config.log_acp_messages:
+            logger.debug("acp_send_response", response=response)
+
+        self.process.stdin.write(data.encode("utf-8"))
+        await self.process.stdin.drain()
 
     async def _stream_events(self) -> AsyncIterator[dict[str, Any]]:
         """Stream events from ACP."""
@@ -397,7 +632,7 @@ class ACPClient:
     async def close(self) -> None:
         """Clean up resources."""
         if self.process is not None:
-            logger.info("closing_acp_client")
+            logger.info("closing_acp_client", request_id=self.request_id, pid=self.process.pid)
 
             try:
                 # Try graceful shutdown

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -13,6 +14,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from kimi_acp_bridge.acp_client import ACPClient
 from kimi_acp_bridge.config import BridgeConfig
+from kimi_acp_bridge.direct_client import DirectClient
 from kimi_acp_bridge.models import (
     ChatCompletionChunk,
     ChatCompletionRequest,
@@ -127,19 +129,28 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
         return ModelList(data=AVAILABLE_MODELS)
 
     @app.post("/v1/chat/completions", response_model=None)
-    async def chat_completions(request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
+    async def chat_completions(
+        http_request: Request,
+        request: ChatCompletionRequest,
+    ) -> StreamingResponse | JSONResponse:
         """OpenAI-compatible chat completions endpoint."""
         start_time = time.time()
         request_id = generate_completion_id()
         created = int(time.time())
 
+        # Dual-mode routing: client can override backend per-request via header
+        effective_backend = http_request.headers.get("x-kimi-backend", config.kimi_backend).lower()
+
         logger.info(
             "chat_completion_request",
             request_id=request_id,
             model=request.model,
+            backend=effective_backend,
             stream=request.stream,
             num_messages=len(request.messages),
             has_tools=request.tools is not None,
+            response_format=request.response_format.type if request.response_format else None,
+            request_body_bytes=len(request.model_dump_json(exclude_none=True).encode("utf-8")),
         )
 
         # Validate model
@@ -157,19 +168,153 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
                 ).model_dump(),
             )
 
+        # Handle tool_choice: "none" by stripping tools
+        effective_tools = request.tools
+        if request.tool_choice == "none":
+            effective_tools = None
+            logger.debug(
+                "tool_choice_none_set",
+                message="Stripping tools from request due to tool_choice=none",
+            )
+
         # Convert OpenAI messages to ACP format
-        preamble, acp_messages = openai_to_acp_messages(request.messages)
+        translate_start = time.perf_counter()
+        preamble, acp_messages = openai_to_acp_messages(
+            request.messages,
+            response_format=request.response_format,
+        )
 
         # Convert tools if present
-        acp_tools = openai_to_acp_tools(request.tools) if request.tools else None
+        acp_tools = openai_to_acp_tools(effective_tools) if effective_tools else None
+        logger.info(
+            "chat_completion_translated",
+            request_id=request_id,
+            duration_ms=round((time.perf_counter() - translate_start) * 1000, 2),
+            preamble_bytes=len((preamble or "").encode("utf-8")),
+            acp_messages_count=len(acp_messages),
+            acp_messages_json_bytes=len(json.dumps(acp_messages).encode("utf-8")),
+            acp_tools_count=len(acp_tools or []),
+        )
+
+        if effective_backend == "direct":
+            if effective_tools is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=ErrorResponse(
+                        error=ErrorDetail(
+                            message=(
+                                "Kimi direct backend does not support native tool calls. "
+                                "Use tool_choice='none' or backend='acp'."
+                            ),
+                            type="invalid_request_error",
+                            param="tools",
+                            code="tools_not_supported",
+                        )
+                    ).model_dump(),
+                )
+
+            direct_client = DirectClient(config, request_id=request_id)
+
+            if request.stream:
+                async def generate_direct_stream() -> AsyncIterator[str]:
+                    result = await direct_client.prompt(preamble, acp_messages)
+                    content_chunk = ChatCompletionChunk(
+                        id=request_id,
+                        created=created,
+                        model=request.model,
+                        choices=[
+                            StreamingChoice(
+                                index=0,
+                                delta=ChoiceDelta(role="assistant", content=result.content),
+                                finish_reason=None,
+                            )
+                        ],
+                    )
+                    yield f"data: {content_chunk.model_dump_json(exclude_none=True)}\n\n"
+
+                    final_chunk = create_final_chunk(request.model, request_id, created)
+                    yield f"data: {final_chunk.model_dump_json(exclude_none=True)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                    logger.info(
+                        "chat_completion_complete",
+                        request_id=request_id,
+                        duration_ms=round((time.time() - start_time) * 1000, 2),
+                        streaming=True,
+                        backend="direct",
+                    )
+
+                return StreamingResponse(
+                    generate_direct_stream(),
+                    media_type="text/plain",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "Content-Type": "text/event-stream",
+                    },
+                )
+
+            result = await direct_client.prompt(preamble, acp_messages)
+            if not result.content.strip():
+                logger.error(
+                    "chat_completion_empty_response",
+                    request_id=request_id,
+                    duration_ms=round((time.time() - start_time) * 1000, 2),
+                    backend="direct",
+                )
+                raise RuntimeError("Kimi direct process exited without returning content")
+
+            prompt_tokens = estimate_token_count(result.prompt_text)
+            completion_tokens = estimate_token_count(result.content)
+            response = ChatCompletionResponse(
+                id=request_id,
+                created=created,
+                model=request.model,
+                choices=[
+                    Choice(
+                        index=0,
+                        message=Message(role="assistant", content=result.content),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=Usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
+                ),
+            )
+
+            logger.info(
+                "chat_completion_complete",
+                request_id=request_id,
+                duration_ms=round((time.time() - start_time) * 1000, 2),
+                streaming=False,
+                backend="direct",
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
+            return JSONResponse(content=response.model_dump(exclude_none=True))
 
         try:
-            client = ACPClient(config)
+            client = ACPClient(config, request_id=request_id)
+            connect_start = time.perf_counter()
             await client.connect()
+            logger.info(
+                "chat_completion_acp_connected",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - connect_start) * 1000, 2),
+            )
 
+            session_start = time.perf_counter()
             session = await client.create_session(
                 preamble=preamble,
                 tools=acp_tools,
+            )
+            logger.info(
+                "chat_completion_session_ready",
+                request_id=request_id,
+                session_id=session.session_id,
+                duration_ms=round((time.perf_counter() - session_start) * 1000, 2),
             )
 
             if request.stream:
@@ -177,10 +322,27 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
                 async def generate_stream() -> AsyncIterator[str]:
                     completion_id = request_id
                     has_tool_calls = False
+                    prompt_start = time.perf_counter()
+                    first_event_logged = False
 
                     try:
-                        async for event in client.prompt(session, acp_messages, stream=True):
+                        async for event in client.prompt(
+                            session,
+                            acp_messages,
+                            stream=True,
+                            enable_native_tools=effective_tools is not None,
+                        ):
                             event_type = event.get("type", "")
+                            if not first_event_logged:
+                                first_event_logged = True
+                                logger.info(
+                                    "chat_completion_first_event",
+                                    request_id=request_id,
+                                    event_type=event_type,
+                                    duration_ms=round(
+                                        (time.perf_counter() - prompt_start) * 1000, 2
+                                    ),
+                                )
 
                             # Handle tool calls
                             if event_type == "tool_call.start":
@@ -249,25 +411,49 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
                 # Non-streaming response
                 full_content = ""
                 tool_calls: list[ToolCall] = []
+                prompt_start = time.perf_counter()
+                first_event_logged = False
 
-                async for event in client.prompt(session, acp_messages, stream=False):
-                    if event.get("type") == "complete":
-                        full_content = event.get("content", "")
-                        raw_tool_calls = event.get("tool_calls", [])
-
-                        for tc in raw_tool_calls:
-                            tool_calls.append(
-                                ToolCall(
-                                    id=tc.get("id", generate_tool_call_id()),
-                                    function=ToolCallFunction(
-                                        name=tc.get("function", {}).get("name", ""),
-                                        arguments=tc.get("function", {}).get("arguments", ""),
-                                    ),
-                                )
+                try:
+                    async for event in client.prompt(
+                        session,
+                        acp_messages,
+                        stream=False,
+                        enable_native_tools=effective_tools is not None,
+                    ):
+                        if not first_event_logged and event.get("type"):
+                            first_event_logged = True
+                            logger.info(
+                                "chat_completion_first_event",
+                                request_id=request_id,
+                                event_type=event.get("type", ""),
+                                duration_ms=round((time.perf_counter() - prompt_start) * 1000, 2),
                             )
-                        break
+                        if event.get("type") == "complete":
+                            full_content = event.get("content", "")
+                            raw_tool_calls = event.get("tool_calls", [])
 
-                await client.close()
+                            for tc in raw_tool_calls:
+                                tool_calls.append(
+                                    ToolCall(
+                                        id=tc.get("id", generate_tool_call_id()),
+                                        function=ToolCallFunction(
+                                            name=tc.get("function", {}).get("name", ""),
+                                            arguments=tc.get("function", {}).get("arguments", ""),
+                                        ),
+                                    )
+                                )
+                            break
+                finally:
+                    await client.close()
+
+                if not full_content.strip() and not tool_calls:
+                    logger.error(
+                        "chat_completion_empty_response",
+                        request_id=request_id,
+                        duration_ms=round((time.time() - start_time) * 1000, 2),
+                    )
+                    raise RuntimeError("Kimi ACP process exited without returning content")
 
                 # Build response
                 prompt_text = "\n".join(m.content or "" for m in request.messages)

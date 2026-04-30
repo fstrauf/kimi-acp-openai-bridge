@@ -47,6 +47,13 @@ class ToolCallFunction(BaseModel):
     arguments: str  # JSON string
 
 
+class ResponseFormat(BaseModel):
+    """Response format configuration for structured output."""
+
+    type: Literal["text", "json_object", "json_schema"] = "text"
+    json_schema: dict[str, Any] | None = None
+
+
 class ChatCompletionRequest(BaseModel):
     """OpenAI chat completion request."""
 
@@ -55,6 +62,7 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     tools: list[Tool] | None = None
     tool_choice: Literal["auto", "none", "required"] | dict[str, Any] = "auto"
+    response_format: ResponseFormat | None = None
     temperature: float | None = Field(default=None, ge=0, le=2)
     max_tokens: int | None = Field(default=None, ge=1)
     top_p: float | None = Field(default=None, ge=0, le=1)

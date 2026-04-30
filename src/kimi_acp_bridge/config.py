@@ -29,6 +29,7 @@ class BridgeConfig:
     """Configuration for the Kimi ACP Bridge.
 
     Attributes:
+        kimi_backend: Execution backend for Kimi requests (acp or direct)
         kimi_binary: Path to the kimi CLI binary
         kimi_args: Arguments to pass to kimi CLI
         host: Server bind address
@@ -43,6 +44,7 @@ class BridgeConfig:
     """
 
     # Kimi CLI settings
+    kimi_backend: Literal["acp", "direct"] = "acp"
     kimi_binary: str = "kimi"
     kimi_args: list[str] = field(default_factory=lambda: ["acp"])
 
@@ -67,6 +69,7 @@ class BridgeConfig:
     def from_env(cls) -> BridgeConfig:
         """Create configuration from environment variables."""
         return cls(
+            kimi_backend=os.getenv("KIMI_BRIDGE_BACKEND", "acp"),  # type: ignore[arg-type]
             kimi_binary=os.getenv("KIMI_BINARY", "kimi"),
             kimi_args=os.getenv("KIMI_ARGS", "acp").split(),
             host=os.getenv("KIMI_BRIDGE_HOST", "127.0.0.1"),
@@ -93,6 +96,7 @@ class BridgeConfig:
             config.port = data["server"].get("port", config.port)
 
         if "kimi" in data:
+            config.kimi_backend = data["kimi"].get("backend", config.kimi_backend)
             config.kimi_binary = data["kimi"].get("binary", config.kimi_binary)
             config.kimi_args = data["kimi"].get("args", config.kimi_args)
 
@@ -136,6 +140,8 @@ class BridgeConfig:
         env_config = cls.from_env()
 
         # Only override if env vars are explicitly set
+        if os.getenv("KIMI_BRIDGE_BACKEND"):
+            config.kimi_backend = env_config.kimi_backend
         if os.getenv("KIMI_BINARY"):
             config.kimi_binary = env_config.kimi_binary
         if os.getenv("KIMI_ARGS"):

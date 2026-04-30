@@ -10,6 +10,7 @@ class TestBridgeConfig:
         """Test default configuration values."""
         config = BridgeConfig()
 
+        assert config.kimi_backend == "acp"
         assert config.kimi_binary == "kimi"
         assert config.kimi_args == ["acp"]
         assert config.host == "127.0.0.1"
@@ -25,12 +26,14 @@ class TestBridgeConfig:
     def test_from_env(self, monkeypatch):
         """Test loading from environment variables."""
         monkeypatch.setenv("KIMI_BINARY", "/usr/local/bin/kimi")
+        monkeypatch.setenv("KIMI_BRIDGE_BACKEND", "direct")
         monkeypatch.setenv("KIMI_BRIDGE_HOST", "0.0.0.0")
         monkeypatch.setenv("KIMI_BRIDGE_PORT", "9000")
         monkeypatch.setenv("KIMI_BRIDGE_LOG_LEVEL", "DEBUG")
 
         config = BridgeConfig.from_env()
 
+        assert config.kimi_backend == "direct"
         assert config.kimi_binary == "/usr/local/bin/kimi"
         assert config.host == "0.0.0.0"
         assert config.port == 9000
@@ -45,6 +48,7 @@ server:
   port: 9000
 
 kimi:
+  backend: direct
   binary: /usr/bin/kimi
   args: ["acp", "--verbose"]
 
@@ -65,6 +69,7 @@ logging:
 
         assert config.host == "0.0.0.0"
         assert config.port == 9000
+        assert config.kimi_backend == "direct"
         assert config.kimi_binary == "/usr/bin/kimi"
         assert config.kimi_args == ["acp", "--verbose"]
         assert config.session_timeout == 600
