@@ -308,12 +308,16 @@ class ACPClient:
                         details={"timeout_seconds": self.config.acp_total_timeout, "elapsed_seconds": round(elapsed, 2)},
                     )
 
-                # Phase-specific timeouts: first event gets longer, then idle timeout
-                read_timeout = (
-                    self.config.acp_first_event_timeout
-                    if not first_readline_done
-                    else self.config.idle_timeout
-                )
+                # Phase-specific timeouts:
+                # 1. First ACP event gets acp_first_event_timeout
+                # 2. First content chunk gets acp_first_content_timeout
+                # 3. Everything after first content gets idle_timeout
+                if not first_readline_done:
+                    read_timeout = self.config.acp_first_event_timeout
+                elif not first_content_logged:
+                    read_timeout = self.config.acp_first_content_timeout
+                else:
+                    read_timeout = self.config.idle_timeout
                 first_readline_done = True
 
                 # Read raw message (could be response or notification)
@@ -462,15 +466,23 @@ class ACPClient:
                     pass
 
             except asyncio.TimeoutError:
-                phase = "acp_first_event" if not first_event_logged else "idle"
-                code = "acp_first_event_timeout" if not first_event_logged else "backend_timeout"
+                if not first_event_logged:
+                    phase = "acp_first_event"
+                    code = "acp_first_event_timeout"
+                elif not first_content_logged:
+                    phase = "acp_first_content"
+                    code = "acp_first_content_timeout"
+                else:
+                    phase = "idle"
+                    code = "backend_timeout"
                 logger.error(
                     "acp_read_timeout",
                     request_id=self.request_id,
                     phase=phase,
+                    code=code,
                     elapsed_seconds=round(time.perf_counter() - overall_start, 2),
                 )
-                yield {"type": "error", "error": {"message": f"ACP {phase} timeout"}}
+                yield {"type": "error", "error": {"message": f"ACP {phase} timeout", "code": code}}
                 break
             except json.JSONDecodeError as e:
                 logger.error("acp_json_error", error=str(e))

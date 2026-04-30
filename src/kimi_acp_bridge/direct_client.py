@@ -100,12 +100,13 @@ class DirectClient:
                 *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=dict(os.environ),
+                env=build_controlled_env(),
             )
         except FileNotFoundError as e:
-            raise RuntimeError(
-                f"Kimi CLI not found at '{self.config.kimi_binary}'. "
-                "Please ensure Kimi CLI is installed and in PATH."
+            raise BridgeError(
+                code="kimi_not_found",
+                message=f"Kimi CLI not found at '{self.config.kimi_binary}'. Please ensure Kimi CLI is installed and in PATH.",
+                phase="direct_spawn",
             ) from e
 
         try:
