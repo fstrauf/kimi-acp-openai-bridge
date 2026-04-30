@@ -11,6 +11,8 @@ from typing import Any
 import structlog
 
 from kimi_acp_bridge.config import BridgeConfig
+from kimi_acp_bridge.models import BridgeError
+from kimi_acp_bridge.utils import build_controlled_env, validate_work_dir
 
 logger = structlog.get_logger()
 
@@ -109,13 +111,20 @@ class DirectClient:
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(),
-                timeout=self.config.session_timeout,
+                timeout=self.config.direct_timeout,
             )
         except asyncio.TimeoutError as e:
             proc.kill()
-            await proc.wait()
-            raise RuntimeError(
-                f"Kimi direct process timed out after {self.config.session_timeout} seconds"
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+            raise BridgeError(
+                code="backend_timeout",
+                message=f"Kimi direct process timed out after {self.config.direct_timeout}s",
+                phase="direct_request",
+                details={"timeout_seconds": self.config.direct_timeout},
             ) from e
 
         duration_ms = round((time.perf_counter() - start) * 1000, 2)
@@ -131,8 +140,35 @@ class DirectClient:
             stderr_chars=len(error_text),
         )
 
+        # Detect step-limit messages even on "successful" exit
+        combined_output = content + "\n" + error_text
+        if "max number of steps reached" in combined_output.lower():
+            raise BridgeError(
+                code="backend_step_limit",
+                message="Kimi reached the maximum number of steps",
+                phase="direct_request",
+                details={
+                    "exit_code": proc.returncode,
+                    "stdout_chars": len(content),
+                    "stderr_chars": len(error_text),
+                },
+            )
+
         if proc.returncode != 0 and not content:
-            raise RuntimeError(error_text or f"Kimi direct exited with code {proc.returncode}")
+            raise BridgeError(
+                code="backend_process_failed",
+                message=error_text or f"Kimi direct exited with code {proc.returncode}",
+                phase="direct_request",
+                details={"exit_code": proc.returncode},
+            )
+
+        if not content.strip():
+            raise BridgeError(
+                code="backend_empty_response",
+                message="Kimi direct process exited successfully but returned no content",
+                phase="direct_request",
+                details={"exit_code": proc.returncode},
+            )
 
         return DirectResult(
             content=content,

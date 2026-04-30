@@ -167,6 +167,52 @@ class TestTokenEstimation:
         assert tokens == 1
 
 
+class TestArrayContentNormalization:
+    """Test that array-form content is normalized to strings."""
+
+    def test_single_text_part(self):
+        from kimi_acp_bridge.models import Message
+
+        msg = Message(role="system", content=[{"type": "text", "text": "Hello"}])
+        assert msg.content == "Hello"
+
+    def test_multiple_text_parts_concatenated(self):
+        from kimi_acp_bridge.models import Message
+
+        msg = Message(
+            role="system",
+            content=[
+                {"type": "text", "text": "You are helpful. "},
+                {"type": "text", "text": "Be concise."},
+            ],
+        )
+        assert msg.content == "You are helpful. Be concise."
+
+    def test_mixed_with_unknown_parts(self):
+        from kimi_acp_bridge.models import Message
+
+        msg = Message(
+            role="user",
+            content=[
+                {"type": "text", "text": "Hello"},
+                {"type": "image_url", "image_url": {"url": "http://example.com/img.png"}},
+            ],
+        )
+        assert msg.content == "Hello"
+
+    def test_plain_string_unchanged(self):
+        from kimi_acp_bridge.models import Message
+
+        msg = Message(role="user", content="Plain text")
+        assert msg.content == "Plain text"
+
+    def test_none_content(self):
+        from kimi_acp_bridge.models import Message
+
+        msg = Message(role="assistant", content=None)
+        assert msg.content is None
+
+
 class TestACPToOpenAI:
     """Test ACP to OpenAI translation."""
 

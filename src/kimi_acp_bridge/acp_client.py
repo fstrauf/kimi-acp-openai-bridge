@@ -14,6 +14,8 @@ from typing import Any
 import structlog
 
 from kimi_acp_bridge.config import BridgeConfig
+from kimi_acp_bridge.models import BridgeError
+from kimi_acp_bridge.utils import build_controlled_env, validate_work_dir
 
 logger = structlog.get_logger()
 
@@ -59,7 +61,7 @@ class ACPClient:
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE if self.config.log_acp_messages else None,
-                    env=dict(os.environ),
+                    env=build_controlled_env(),
                 )
                 spawn_ms = round((time.perf_counter() - connect_start) * 1000, 2)
                 logger.info(
@@ -83,7 +85,7 @@ class ACPClient:
                 )
 
                 # Wait for initialize response
-                response = await self._read_response()
+                response = await self._read_response(timeout=self.config.acp_initialize_timeout)
                 if response.get("result"):
                     logger.info(
                         "acp_initialized",
@@ -92,7 +94,11 @@ class ACPClient:
                     )
                 else:
                     error = response.get("error", {})
-                    raise RuntimeError(f"ACP initialization failed: {error}")
+                    raise BridgeError(
+                        code="backend_process_failed",
+                        message=f"ACP initialization failed: {error}",
+                        phase="acp_initialize",
+                    )
 
                 # Send initialized notification
                 await self._send_notification("initialized", {})
@@ -103,16 +109,30 @@ class ACPClient:
                     request_id=self.request_id,
                     binary=self.config.kimi_binary,
                 )
-                raise RuntimeError(
-                    f"Kimi CLI not found at '{self.config.kimi_binary}'. "
-                    "Please ensure Kimi CLI is installed and in PATH."
+                raise BridgeError(
+                    code="kimi_not_found",
+                    message=f"Kimi CLI not found at '{self.config.kimi_binary}'. Please ensure Kimi CLI is installed and in PATH.",
+                    phase="acp_initialize",
+                ) from e
+            except asyncio.TimeoutError as e:
+                logger.error("acp_initialize_timeout", request_id=self.request_id)
+                await self.close()
+                raise BridgeError(
+                    code="acp_initialize_timeout",
+                    message=f"ACP initialize timed out after {self.config.acp_initialize_timeout}s",
+                    phase="acp_initialize",
+                    details={"timeout_seconds": self.config.acp_initialize_timeout},
                 ) from e
             except Exception as e:
                 logger.error("failed_to_spawn_kimi", request_id=self.request_id, error=str(e))
                 await self.close()
-                if isinstance(e, RuntimeError):
+                if isinstance(e, BridgeError):
                     raise
-                raise RuntimeError(f"Failed to start Kimi ACP process: {e}") from e
+                raise BridgeError(
+                    code="backend_process_failed",
+                    message=f"Failed to start Kimi ACP process: {e}",
+                    phase="acp_initialize",
+                ) from e
 
     async def create_session(
         self,
@@ -124,9 +144,19 @@ class ACPClient:
         if self.process is None:
             await self.connect()
 
+        work_dir = cwd or os.getcwd()
+        try:
+            work_dir = validate_work_dir(work_dir)
+        except ValueError as e:
+            raise BridgeError(
+                code="invalid_request_error",
+                message=str(e),
+                phase="acp_session",
+            ) from e
+
         # Use ACP session/new method
         params: dict[str, Any] = {
-            "cwd": cwd or os.getcwd(),
+            "cwd": work_dir,
             "mcpServers": [],  # No MCP servers for now
         }
         # preamble is accepted by the bridge but currently ignored by Kimi ACP.
@@ -137,11 +167,15 @@ class ACPClient:
         session_start = time.perf_counter()
         await self._send_request("session/new", params)
 
-        response = await self._read_response()
+        response = await self._read_response(timeout=self.config.acp_session_timeout)
         result = response.get("result", {})
 
         if "error" in response:
-            raise RuntimeError(f"Failed to create session: {response['error']}")
+            raise BridgeError(
+                code="backend_process_failed",
+                message=f"Failed to create session: {response['error']}",
+                phase="acp_session",
+            )
 
         session_id = result.get("sessionId", str(uuid.uuid4()))
         self._session = ACPSession(
@@ -260,12 +294,32 @@ class ACPClient:
         first_content_logged = False
 
         # Read events until done or timeout
+        overall_start = time.perf_counter()
+        first_readline_done = False
         while True:
             try:
+                # Enforce overall ACP total timeout
+                elapsed = time.perf_counter() - overall_start
+                if elapsed > self.config.acp_total_timeout:
+                    raise BridgeError(
+                        code="backend_timeout",
+                        message=f"ACP total request timed out after {self.config.acp_total_timeout}s",
+                        phase="acp_total",
+                        details={"timeout_seconds": self.config.acp_total_timeout, "elapsed_seconds": round(elapsed, 2)},
+                    )
+
+                # Phase-specific timeouts: first event gets longer, then idle timeout
+                read_timeout = (
+                    self.config.acp_first_event_timeout
+                    if not first_readline_done
+                    else self.config.idle_timeout
+                )
+                first_readline_done = True
+
                 # Read raw message (could be response or notification)
                 line = await asyncio.wait_for(
                     self.process.stdout.readline(),
-                    timeout=self.config.session_timeout,
+                    timeout=read_timeout,
                 )
 
                 if not line:
@@ -392,7 +446,11 @@ class ACPClient:
                 # Handle response to our prompt request (has matching id)
                 elif event.get("id") == self._message_id:
                     if event.get("error"):
-                        raise RuntimeError(f"Prompt failed: {event['error']}")
+                        raise BridgeError(
+                            code="backend_process_failed",
+                            message=f"Prompt failed: {event['error']}",
+                            phase="acp_prompt",
+                        )
                     # Got final result - signal completion
                     if stream:
                         yield {"type": "done"}
@@ -404,8 +462,15 @@ class ACPClient:
                     pass
 
             except asyncio.TimeoutError:
-                logger.error("acp_read_timeout")
-                yield {"type": "error", "error": {"message": "Session timeout"}}
+                phase = "acp_first_event" if not first_event_logged else "idle"
+                code = "acp_first_event_timeout" if not first_event_logged else "backend_timeout"
+                logger.error(
+                    "acp_read_timeout",
+                    request_id=self.request_id,
+                    phase=phase,
+                    elapsed_seconds=round(time.perf_counter() - overall_start, 2),
+                )
+                yield {"type": "error", "error": {"message": f"ACP {phase} timeout"}}
                 break
             except json.JSONDecodeError as e:
                 logger.error("acp_json_error", error=str(e))
@@ -423,6 +488,7 @@ class ACPClient:
             duration_ms=round((time.perf_counter() - prompt_start) * 1000, 2),
             events_seen=events_seen,
             content_chars=len(full_content),
+            completion_bytes=len(full_content.encode("utf-8")),
             tool_calls_count=len(tool_calls),
         )
 
@@ -611,16 +677,35 @@ class ACPClient:
         self.process.stdin.write(data.encode("utf-8"))
         await self.process.stdin.drain()
 
-    async def _read_response(self) -> dict[str, Any]:
+    async def _read_response(self, timeout: float | None = None) -> dict[str, Any]:
         """Read a single JSON-RPC response."""
         if self.process is None or self.process.stdout is None:
-            raise RuntimeError("Not connected")
+            raise BridgeError(
+                code="backend_unavailable",
+                message="ACP client not connected",
+                phase="acp_read",
+            )
 
         buffer = ""
         while True:
-            line = await self.process.stdout.readline()
+            try:
+                line = await asyncio.wait_for(
+                    self.process.stdout.readline(),
+                    timeout=timeout or self.config.session_timeout,
+                )
+            except asyncio.TimeoutError as e:
+                raise BridgeError(
+                    code="backend_timeout",
+                    message="Timeout reading ACP response",
+                    phase="acp_read",
+                    details={"timeout_seconds": timeout or self.config.session_timeout},
+                ) from e
             if not line:
-                raise RuntimeError("EOF while reading response")
+                raise BridgeError(
+                    code="backend_empty_response",
+                    message="EOF while reading ACP response",
+                    phase="acp_read",
+                )
 
             buffer += line.decode("utf-8", errors="replace")
 

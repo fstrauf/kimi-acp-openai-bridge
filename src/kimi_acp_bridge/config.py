@@ -44,7 +44,7 @@ class BridgeConfig:
     """
 
     # Kimi CLI settings
-    kimi_backend: Literal["acp", "direct"] = "acp"
+    kimi_backend: Literal["acp", "direct", "auto"] = "acp"
     kimi_binary: str = "kimi"
     kimi_args: list[str] = field(default_factory=lambda: ["acp"])
 
@@ -54,7 +54,26 @@ class BridgeConfig:
 
     # Session settings
     session_mode: Literal["ephemeral", "persistent"] = "ephemeral"
-    session_timeout: int = 300  # seconds
+    session_timeout: int = 300  # seconds (legacy fallback)
+
+    # Prompt size limits (bytes)
+    max_prompt_bytes_direct: int = 20_000
+    max_prompt_bytes_acp: int = 20_000
+    max_prompt_bytes_warning: int = 15_000
+
+    # Concurrency
+    max_concurrent_requests: int = 2
+
+    # Phase-specific timeouts (seconds)
+    health_timeout: int = 2
+    process_spawn_timeout: int = 10
+    acp_initialize_timeout: int = 30
+    acp_session_timeout: int = 30
+    acp_first_event_timeout: int = 60
+    acp_first_content_timeout: int = 90
+    direct_timeout: int = 120
+    acp_total_timeout: int = 300
+    idle_timeout: int = 60
 
     # Feature flags
     enable_tools: bool = True
@@ -76,6 +95,19 @@ class BridgeConfig:
             port=int(os.getenv("KIMI_BRIDGE_PORT", "8080")),
             session_mode=os.getenv("KIMI_BRIDGE_SESSION_MODE", "ephemeral"),  # type: ignore[arg-type]
             session_timeout=int(os.getenv("KIMI_BRIDGE_SESSION_TIMEOUT", "300")),
+            max_prompt_bytes_direct=int(os.getenv("KIMI_BRIDGE_MAX_PROMPT_BYTES_DIRECT", "20000")),
+            max_prompt_bytes_acp=int(os.getenv("KIMI_BRIDGE_MAX_PROMPT_BYTES_ACP", "20000")),
+            max_prompt_bytes_warning=int(os.getenv("KIMI_BRIDGE_MAX_PROMPT_BYTES_WARNING", "15000")),
+            max_concurrent_requests=int(os.getenv("KIMI_BRIDGE_MAX_CONCURRENT_REQUESTS", "2")),
+            health_timeout=int(os.getenv("KIMI_BRIDGE_HEALTH_TIMEOUT", "2")),
+            process_spawn_timeout=int(os.getenv("KIMI_BRIDGE_PROCESS_SPAWN_TIMEOUT", "10")),
+            acp_initialize_timeout=int(os.getenv("KIMI_BRIDGE_ACP_INIT_TIMEOUT", "30")),
+            acp_session_timeout=int(os.getenv("KIMI_BRIDGE_ACP_SESSION_TIMEOUT", "30")),
+            acp_first_event_timeout=int(os.getenv("KIMI_BRIDGE_ACP_FIRST_EVENT_TIMEOUT", "60")),
+            acp_first_content_timeout=int(os.getenv("KIMI_BRIDGE_ACP_FIRST_CONTENT_TIMEOUT", "90")),
+            direct_timeout=int(os.getenv("KIMI_BRIDGE_DIRECT_TIMEOUT", "120")),
+            acp_total_timeout=int(os.getenv("KIMI_BRIDGE_ACP_TOTAL_TIMEOUT", "300")),
+            idle_timeout=int(os.getenv("KIMI_BRIDGE_IDLE_TIMEOUT", "60")),
             enable_tools=os.getenv("KIMI_BRIDGE_ENABLE_TOOLS", "true").lower() == "true",
             enable_streaming=os.getenv("KIMI_BRIDGE_ENABLE_STREAMING", "true").lower() == "true",
             auto_approve_tools=os.getenv("KIMI_BRIDGE_AUTO_APPROVE", "true").lower() == "true",
@@ -103,6 +135,23 @@ class BridgeConfig:
         if "session" in data:
             config.session_mode = data["session"].get("mode", config.session_mode)
             config.session_timeout = data["session"].get("timeout", config.session_timeout)
+
+        if "timeouts" in data:
+            config.health_timeout = data["timeouts"].get("health", config.health_timeout)
+            config.process_spawn_timeout = data["timeouts"].get("process_spawn", config.process_spawn_timeout)
+            config.acp_initialize_timeout = data["timeouts"].get("acp_initialize", config.acp_initialize_timeout)
+            config.acp_session_timeout = data["timeouts"].get("acp_session", config.acp_session_timeout)
+            config.acp_first_event_timeout = data["timeouts"].get("acp_first_event", config.acp_first_event_timeout)
+            config.acp_first_content_timeout = data["timeouts"].get("acp_first_content", config.acp_first_content_timeout)
+            config.direct_timeout = data["timeouts"].get("direct", config.direct_timeout)
+            config.acp_total_timeout = data["timeouts"].get("acp_total", config.acp_total_timeout)
+            config.idle_timeout = data["timeouts"].get("idle", config.idle_timeout)
+
+        if "limits" in data:
+            config.max_prompt_bytes_direct = data["limits"].get("max_prompt_bytes_direct", config.max_prompt_bytes_direct)
+            config.max_prompt_bytes_acp = data["limits"].get("max_prompt_bytes_acp", config.max_prompt_bytes_acp)
+            config.max_prompt_bytes_warning = data["limits"].get("max_prompt_bytes_warning", config.max_prompt_bytes_warning)
+            config.max_concurrent_requests = data["limits"].get("max_concurrent_requests", config.max_concurrent_requests)
 
         if "features" in data:
             config.enable_tools = data["features"].get("enable_tools", config.enable_tools)
@@ -154,6 +203,32 @@ class BridgeConfig:
             config.session_mode = env_config.session_mode
         if os.getenv("KIMI_BRIDGE_SESSION_TIMEOUT"):
             config.session_timeout = env_config.session_timeout
+        if os.getenv("KIMI_BRIDGE_MAX_PROMPT_BYTES_DIRECT"):
+            config.max_prompt_bytes_direct = env_config.max_prompt_bytes_direct
+        if os.getenv("KIMI_BRIDGE_MAX_PROMPT_BYTES_ACP"):
+            config.max_prompt_bytes_acp = env_config.max_prompt_bytes_acp
+        if os.getenv("KIMI_BRIDGE_MAX_PROMPT_BYTES_WARNING"):
+            config.max_prompt_bytes_warning = env_config.max_prompt_bytes_warning
+        if os.getenv("KIMI_BRIDGE_MAX_CONCURRENT_REQUESTS"):
+            config.max_concurrent_requests = env_config.max_concurrent_requests
+        if os.getenv("KIMI_BRIDGE_HEALTH_TIMEOUT"):
+            config.health_timeout = env_config.health_timeout
+        if os.getenv("KIMI_BRIDGE_PROCESS_SPAWN_TIMEOUT"):
+            config.process_spawn_timeout = env_config.process_spawn_timeout
+        if os.getenv("KIMI_BRIDGE_ACP_INIT_TIMEOUT"):
+            config.acp_initialize_timeout = env_config.acp_initialize_timeout
+        if os.getenv("KIMI_BRIDGE_ACP_SESSION_TIMEOUT"):
+            config.acp_session_timeout = env_config.acp_session_timeout
+        if os.getenv("KIMI_BRIDGE_ACP_FIRST_EVENT_TIMEOUT"):
+            config.acp_first_event_timeout = env_config.acp_first_event_timeout
+        if os.getenv("KIMI_BRIDGE_ACP_FIRST_CONTENT_TIMEOUT"):
+            config.acp_first_content_timeout = env_config.acp_first_content_timeout
+        if os.getenv("KIMI_BRIDGE_DIRECT_TIMEOUT"):
+            config.direct_timeout = env_config.direct_timeout
+        if os.getenv("KIMI_BRIDGE_ACP_TOTAL_TIMEOUT"):
+            config.acp_total_timeout = env_config.acp_total_timeout
+        if os.getenv("KIMI_BRIDGE_IDLE_TIMEOUT"):
+            config.idle_timeout = env_config.idle_timeout
         if os.getenv("KIMI_BRIDGE_ENABLE_TOOLS"):
             config.enable_tools = env_config.enable_tools
         if os.getenv("KIMI_BRIDGE_ENABLE_STREAMING"):

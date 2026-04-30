@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class Message(BaseModel):
@@ -15,6 +15,22 @@ class Message(BaseModel):
     name: str | None = None
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _normalize_content(cls, v: Any) -> str | None:
+        """Accept plain strings or OpenAI content-part arrays and normalize to string."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return v
+        if isinstance(v, list):
+            parts: list[str] = []
+            for part in v:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(part.get("text", ""))
+            return "".join(parts) if parts else None
+        return str(v)
 
 
 class ToolFunction(BaseModel):
@@ -152,6 +168,11 @@ class ErrorDetail(BaseModel):
     type: str
     param: str | None = None
     code: str | None = None
+    retryable: bool | None = None
+    backend: str | None = None
+    request_id: str | None = None
+    phase: str | None = None
+    details: dict[str, Any] | None = None
 
 
 class ErrorResponse(BaseModel):
@@ -160,9 +181,46 @@ class ErrorResponse(BaseModel):
     error: ErrorDetail
 
 
+class BridgeError(RuntimeError):
+    """Structured bridge error that carries enough context for a typed HTTP response."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        phase: str | None = None,
+        details: dict[str, Any] | None = None,
+    ):
+        self.code = code
+        self.phase = phase
+        self.details = details or {}
+        super().__init__(message)
+
+
+class BackendCapabilities(BaseModel):
+    """Capability flags for a backend."""
+
+    available: bool
+    tool_calls: bool
+    json_mode: bool
+    file_io: bool
+
+
+class Limits(BaseModel):
+    """Bridge operational limits."""
+
+    max_prompt_bytes_direct: int
+    max_prompt_bytes_acp: int
+    max_concurrent_requests: int
+
+
 class HealthResponse(BaseModel):
     """Health check response."""
 
     status: str
     kimi_available: bool
-    version: str
+    bridge_version: str
+    kimi_cli_version: str | None = None
+    models: list[str]
+    backends: dict[str, BackendCapabilities]
+    limits: Limits

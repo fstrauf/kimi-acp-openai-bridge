@@ -334,6 +334,22 @@ def create_final_chunk(
     )
 
 
+def compute_prompt_bytes(preamble: str | None, messages: list[dict[str, Any]]) -> int:
+    """Compute the UTF-8 byte size of the prompt text sent to Kimi.
+
+    This is a conservative estimate based on how DirectClient and ACPClient
+    fold preamble + messages into a single text block.
+    """
+    parts: list[str] = []
+    if preamble:
+        parts.append(preamble)
+    for msg in messages:
+        content = msg.get("content", "")
+        if content:
+            parts.append(str(content))
+    return len("\n\n".join(parts).encode("utf-8"))
+
+
 def estimate_token_count(text: str) -> int:
     """Rough estimation of token count.
 

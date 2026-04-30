@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -16,6 +18,8 @@ from kimi_acp_bridge.acp_client import ACPClient
 from kimi_acp_bridge.config import BridgeConfig
 from kimi_acp_bridge.direct_client import DirectClient
 from kimi_acp_bridge.models import (
+    BackendCapabilities,
+    BridgeError,
     ChatCompletionChunk,
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -24,6 +28,7 @@ from kimi_acp_bridge.models import (
     ErrorDetail,
     ErrorResponse,
     HealthResponse,
+    Limits,
     Message,
     ModelInfo,
     ModelList,
@@ -34,6 +39,7 @@ from kimi_acp_bridge.models import (
 )
 from kimi_acp_bridge.translator import (
     acp_to_openai_chunk,
+    compute_prompt_bytes,
     create_final_chunk,
     estimate_token_count,
     generate_completion_id,
@@ -44,6 +50,8 @@ from kimi_acp_bridge.translator import (
 
 logger = structlog.get_logger()
 
+BRIDGE_VERSION = "0.1.0"
+
 # Available models (Kimi K2.5 is the primary model)
 AVAILABLE_MODELS = [
     ModelInfo(
@@ -52,6 +60,37 @@ AVAILABLE_MODELS = [
         owned_by="moonshot-ai",
     ),
 ]
+
+
+def _make_request_id() -> str:
+    """Generate a stable request id."""
+    return f"req_{uuid.uuid4().hex[:24]}"
+
+
+def resolve_backend(
+    request: ChatCompletionRequest,
+    header_value: str,
+    config: BridgeConfig,
+) -> str:
+    """Resolve the effective backend using deterministic auto-routing rules.
+
+    Rules (in order):
+    1. If the client explicitly asks for ``direct`` or ``acp``, honour it.
+    2. If ``auto`` (or config default is ``auto``):
+       - Tools requested and tool_choice != "none"  → ``acp``
+       - response_format == "json_object"           → ``direct`` (fast)
+       - Otherwise                                  → ``direct``
+    """
+    hv = header_value.lower()
+    if hv in ("direct", "acp"):
+        return hv
+
+    # auto or anything else → apply rules
+    if request.tools and request.tool_choice != "none":
+        return "acp"
+    if request.response_format and request.response_format.type == "json_object":
+        return "direct"
+    return "direct"
 
 
 def create_app(config: BridgeConfig | None = None) -> FastAPI:
@@ -85,6 +124,35 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
         lifespan=lifespan,
     )
 
+
+    def _error_response(
+        status_code: int,
+        code: str,
+        message: str,
+        request_id: str,
+        backend: str | None = None,
+        phase: str | None = None,
+        details: dict | None = None,
+        retryable: bool = False,
+    ) -> JSONResponse:
+        """Build a structured JSON error response."""
+        return JSONResponse(
+            status_code=status_code,
+            content=ErrorResponse(
+                error=ErrorDetail(
+                    message=message,
+                    type="invalid_request_error" if status_code < 500 else "service_unavailable",
+                    code=code,
+                    retryable=retryable,
+                    backend=backend,
+                    request_id=request_id,
+                    phase=phase,
+                    details=details,
+                )
+            ).model_dump(exclude_none=True),
+            headers={"x-request-id": request_id},
+        )
+
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
         """Handle unexpected exceptions."""
@@ -97,36 +165,75 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
                     type="internal_error",
                     code="internal_error",
                 )
-            ).model_dump(),
+            ).model_dump(exclude_none=True),
         )
 
     @app.get("/health")
-    async def health_check() -> HealthResponse:
-        """Health check endpoint."""
+    async def health_check() -> JSONResponse:
+        """Health check endpoint with capability discovery."""
+        request_id = _make_request_id()
         kimi_available = False
+        kimi_cli_version = None
         try:
-            # Quick check if kimi binary exists
             proc = await asyncio.create_subprocess_exec(
                 config.kimi_binary,
                 "--version",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            await asyncio.wait_for(proc.wait(), timeout=5.0)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
             kimi_available = proc.returncode == 0
+            if kimi_available:
+                version_text = (
+                    stdout.decode("utf-8", errors="replace").strip()
+                    or stderr.decode("utf-8", errors="replace").strip()
+                )
+                match = re.search(r"(\d+\.\d+\.\d+)", version_text)
+                if match:
+                    kimi_cli_version = match.group(1)
         except Exception:
             pass
 
-        return HealthResponse(
-            status="healthy",
+        body = HealthResponse(
+            status="healthy" if kimi_available else "degraded",
             kimi_available=kimi_available,
-            version="0.1.0",
+            bridge_version=BRIDGE_VERSION,
+            kimi_cli_version=kimi_cli_version,
+            models=[m.id for m in AVAILABLE_MODELS],
+            backends={
+                "direct": BackendCapabilities(
+                    available=kimi_available,
+                    tool_calls=False,
+                    json_mode=True,
+                    file_io=False,
+                ),
+                "acp": BackendCapabilities(
+                    available=kimi_available,
+                    tool_calls=config.enable_tools,
+                    json_mode=True,
+                    file_io=True,
+                ),
+            },
+            limits=Limits(
+                max_prompt_bytes_direct=config.max_prompt_bytes_direct,
+                max_prompt_bytes_acp=config.max_prompt_bytes_acp,
+                max_concurrent_requests=config.max_concurrent_requests,
+            ),
+        )
+        return JSONResponse(
+            content=body.model_dump(exclude_none=True),
+            headers={"x-request-id": request_id},
         )
 
     @app.get("/v1/models")
-    async def list_models() -> ModelList:
+    async def list_models() -> JSONResponse:
         """List available models."""
-        return ModelList(data=AVAILABLE_MODELS)
+        request_id = _make_request_id()
+        body = ModelList(data=AVAILABLE_MODELS)
+        return JSONResponse(
+            content=body.model_dump(exclude_none=True),
+            headers={"x-request-id": request_id},
+        )
 
     @app.post("/v1/chat/completions", response_model=None)
     async def chat_completions(
@@ -138,14 +245,23 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
         request_id = generate_completion_id()
         created = int(time.time())
 
-        # Dual-mode routing: client can override backend per-request via header
-        effective_backend = http_request.headers.get("x-kimi-backend", config.kimi_backend).lower()
+        # Resolve backend: header > auto rules > config default
+        header_backend = http_request.headers.get("x-kimi-backend", config.kimi_backend)
+        effective_backend = resolve_backend(request, header_backend, config)
 
+        logger.info(
+            "request_received",
+            request_id=request_id,
+            method=http_request.method,
+            path=str(http_request.url.path),
+            content_length=http_request.headers.get("content-length"),
+        )
         logger.info(
             "chat_completion_request",
             request_id=request_id,
             model=request.model,
             backend=effective_backend,
+            requested_backend=header_backend,
             stream=request.stream,
             num_messages=len(request.messages),
             has_tools=request.tools is not None,
@@ -156,16 +272,17 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
         # Validate model
         model_ids = [m.id for m in AVAILABLE_MODELS]
         if request.model not in model_ids:
-            raise HTTPException(
+            return JSONResponse(
                 status_code=400,
-                detail=ErrorResponse(
+                content=ErrorResponse(
                     error=ErrorDetail(
                         message=f"Model '{request.model}' not found. Available: {model_ids}",
                         type="invalid_request_error",
                         param="model",
                         code="model_not_found",
                     )
-                ).model_dump(),
+                ).model_dump(exclude_none=True),
+                headers={"x-request-id": request_id},
             )
 
         # Handle tool_choice: "none" by stripping tools
@@ -186,6 +303,53 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
 
         # Convert tools if present
         acp_tools = openai_to_acp_tools(effective_tools) if effective_tools else None
+
+        # Prompt size guard
+        prompt_bytes = compute_prompt_bytes(preamble, acp_messages)
+        prompt_tokens = estimate_token_count(
+            "\n\n".join([preamble or ""] + [m.get("content", "") for m in acp_messages])
+        )
+        max_bytes = (
+            config.max_prompt_bytes_direct
+            if effective_backend == "direct"
+            else config.max_prompt_bytes_acp
+        )
+        if prompt_bytes > config.max_prompt_bytes_warning:
+            logger.warning(
+                "prompt_size_warning",
+                request_id=request_id,
+                backend=effective_backend,
+                prompt_bytes=prompt_bytes,
+                estimated_tokens=prompt_tokens,
+                limit=max_bytes,
+            )
+        if prompt_bytes > max_bytes:
+            logger.error(
+                "prompt_too_large",
+                request_id=request_id,
+                backend=effective_backend,
+                prompt_bytes=prompt_bytes,
+                estimated_tokens=prompt_tokens,
+                limit=max_bytes,
+            )
+            return JSONResponse(
+                status_code=413,
+                content=ErrorResponse(
+                    error=ErrorDetail(
+                        message=f"Prompt too large ({prompt_bytes} bytes). Limit: {max_bytes} bytes.",
+                        type="invalid_request_error",
+                        code="prompt_too_large",
+                        details={
+                            "prompt_bytes": prompt_bytes,
+                            "estimated_tokens": prompt_tokens,
+                            "limit": max_bytes,
+                            "backend": effective_backend,
+                        },
+                    )
+                ).model_dump(exclude_none=True),
+                headers={"x-request-id": request_id},
+            )
+
         logger.info(
             "chat_completion_translated",
             request_id=request_id,
@@ -194,13 +358,15 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
             acp_messages_count=len(acp_messages),
             acp_messages_json_bytes=len(json.dumps(acp_messages).encode("utf-8")),
             acp_tools_count=len(acp_tools or []),
+            prompt_bytes=prompt_bytes,
+            estimated_tokens=prompt_tokens,
         )
 
         if effective_backend == "direct":
             if effective_tools is not None:
-                raise HTTPException(
-                    status_code=400,
-                    detail=ErrorResponse(
+                return JSONResponse(
+                    status_code=422,
+                    content=ErrorResponse(
                         error=ErrorDetail(
                             message=(
                                 "Kimi direct backend does not support native tool calls. "
@@ -210,90 +376,113 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
                             param="tools",
                             code="tools_not_supported",
                         )
-                    ).model_dump(),
+                    ).model_dump(exclude_none=True),
+                    headers={"x-request-id": request_id},
                 )
 
             direct_client = DirectClient(config, request_id=request_id)
 
-            if request.stream:
-                async def generate_direct_stream() -> AsyncIterator[str]:
-                    result = await direct_client.prompt(preamble, acp_messages)
-                    content_chunk = ChatCompletionChunk(
-                        id=request_id,
-                        created=created,
-                        model=request.model,
-                        choices=[
-                            StreamingChoice(
-                                index=0,
-                                delta=ChoiceDelta(role="assistant", content=result.content),
-                                finish_reason=None,
-                            )
-                        ],
+            try:
+                if request.stream:
+                    async def generate_direct_stream() -> AsyncIterator[str]:
+                        result = await direct_client.prompt(preamble, acp_messages)
+                        content_chunk = ChatCompletionChunk(
+                            id=request_id,
+                            created=created,
+                            model=request.model,
+                            choices=[
+                                StreamingChoice(
+                                    index=0,
+                                    delta=ChoiceDelta(role="assistant", content=result.content),
+                                    finish_reason=None,
+                                )
+                            ],
+                        )
+                        yield f"data: {content_chunk.model_dump_json(exclude_none=True)}\n\n"
+
+                        final_chunk = create_final_chunk(request.model, request_id, created)
+                        yield f"data: {final_chunk.model_dump_json(exclude_none=True)}\n\n"
+                        yield "data: [DONE]\n\n"
+
+                        logger.info(
+                            "chat_completion_complete",
+                            request_id=request_id,
+                            duration_ms=round((time.time() - start_time) * 1000, 2),
+                            streaming=True,
+                            backend="direct",
+                        )
+
+                    return StreamingResponse(
+                        generate_direct_stream(),
+                        media_type="text/plain",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "Content-Type": "text/event-stream",
+                            "x-request-id": request_id,
+                        },
                     )
-                    yield f"data: {content_chunk.model_dump_json(exclude_none=True)}\n\n"
 
-                    final_chunk = create_final_chunk(request.model, request_id, created)
-                    yield f"data: {final_chunk.model_dump_json(exclude_none=True)}\n\n"
-                    yield "data: [DONE]\n\n"
+                result = await direct_client.prompt(preamble, acp_messages)
 
-                    logger.info(
-                        "chat_completion_complete",
-                        request_id=request_id,
-                        duration_ms=round((time.time() - start_time) * 1000, 2),
-                        streaming=True,
-                        backend="direct",
-                    )
-
-                return StreamingResponse(
-                    generate_direct_stream(),
-                    media_type="text/plain",
-                    headers={
-                        "Cache-Control": "no-cache",
-                        "Connection": "keep-alive",
-                        "Content-Type": "text/event-stream",
-                    },
+                prompt_tokens = estimate_token_count(result.prompt_text)
+                completion_tokens = estimate_token_count(result.content)
+                response = ChatCompletionResponse(
+                    id=request_id,
+                    created=created,
+                    model=request.model,
+                    choices=[
+                        Choice(
+                            index=0,
+                            message=Message(role="assistant", content=result.content),
+                            finish_reason="stop",
+                        )
+                    ],
+                    usage=Usage(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=prompt_tokens + completion_tokens,
+                    ),
                 )
 
-            result = await direct_client.prompt(preamble, acp_messages)
-            if not result.content.strip():
-                logger.error(
-                    "chat_completion_empty_response",
+                logger.info(
+                    "chat_completion_complete",
+                    request_id=request_id,
+                    duration_ms=round((time.time() - start_time) * 1000, 2),
+                    streaming=False,
+                    backend="direct",
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
+                logger.info(
+                    "response_serialized",
                     request_id=request_id,
                     duration_ms=round((time.time() - start_time) * 1000, 2),
                     backend="direct",
                 )
-                raise RuntimeError("Kimi direct process exited without returning content")
-
-            prompt_tokens = estimate_token_count(result.prompt_text)
-            completion_tokens = estimate_token_count(result.content)
-            response = ChatCompletionResponse(
-                id=request_id,
-                created=created,
-                model=request.model,
-                choices=[
-                    Choice(
-                        index=0,
-                        message=Message(role="assistant", content=result.content),
-                        finish_reason="stop",
-                    )
-                ],
-                usage=Usage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=prompt_tokens + completion_tokens,
-                ),
-            )
-
-            logger.info(
-                "chat_completion_complete",
-                request_id=request_id,
-                duration_ms=round((time.time() - start_time) * 1000, 2),
-                streaming=False,
-                backend="direct",
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-            )
-            return JSONResponse(content=response.model_dump(exclude_none=True))
+                return JSONResponse(
+                    content=response.model_dump(exclude_none=True),
+                    headers={"x-request-id": request_id},
+                )
+            except BridgeError as e:
+                logger.error(
+                    "kimi_bridge_error",
+                    error=str(e),
+                    request_id=request_id,
+                    code=e.code,
+                    phase=e.phase,
+                )
+                status = 504 if "timeout" in e.code else 503
+                return _error_response(
+                    status_code=status,
+                    code=e.code,
+                    message=str(e),
+                    request_id=request_id,
+                    backend="direct",
+                    phase=e.phase,
+                    details=e.details,
+                    retryable="timeout" in e.code or e.code in ("backend_step_limit",),
+                )
 
         try:
             client = ACPClient(config, request_id=request_id)
@@ -404,6 +593,7 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
                         "Cache-Control": "no-cache",
                         "Connection": "keep-alive",
                         "Content-Type": "text/event-stream",
+                        "x-request-id": request_id,
                     },
                 )
 
@@ -453,7 +643,11 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
                         request_id=request_id,
                         duration_ms=round((time.time() - start_time) * 1000, 2),
                     )
-                    raise RuntimeError("Kimi ACP process exited without returning content")
+                    raise BridgeError(
+                        code="backend_empty_response",
+                        message="Kimi ACP process exited successfully but returned no content",
+                        phase="acp_completion",
+                    )
 
                 # Build response
                 prompt_text = "\n".join(m.content or "" for m in request.messages)
@@ -494,32 +688,44 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
                     completion_tokens=completion_tokens,
                 )
 
-                return JSONResponse(content=response.model_dump(exclude_none=True))
+                logger.info(
+                    "response_serialized",
+                    request_id=request_id,
+                    duration_ms=round((time.time() - start_time) * 1000, 2),
+                    backend="acp",
+                )
+                return JSONResponse(
+                    content=response.model_dump(exclude_none=True),
+                    headers={"x-request-id": request_id},
+                )
 
-        except RuntimeError as e:
-            logger.error("kimi_runtime_error", error=str(e))
-            raise HTTPException(
-                status_code=503,
-                detail=ErrorResponse(
-                    error=ErrorDetail(
-                        message=str(e),
-                        type="service_unavailable",
-                        code="kimi_unavailable",
-                    )
-                ).model_dump(),
-            ) from e
+        except BridgeError as e:
+            logger.error(
+                "kimi_bridge_error",
+                error=str(e),
+                request_id=request_id,
+                code=e.code,
+                phase=e.phase,
+            )
+            status = 504 if "timeout" in e.code else 503
+            return _error_response(
+                status_code=status,
+                code=e.code,
+                message=str(e),
+                request_id=request_id,
+                backend=effective_backend,
+                phase=e.phase,
+                details=e.details,
+                retryable="timeout" in e.code or e.code in ("backend_step_limit",),
+            )
 
         except Exception as e:
-            logger.error("chat_completion_error", error=str(e))
-            raise HTTPException(
+            logger.error("chat_completion_error", error=str(e), request_id=request_id)
+            return _error_response(
                 status_code=500,
-                detail=ErrorResponse(
-                    error=ErrorDetail(
-                        message=f"Internal error: {str(e)}",
-                        type="internal_error",
-                        code="internal_error",
-                    )
-                ).model_dump(),
-            ) from e
-
+                code="internal_error",
+                message=f"Internal error: {str(e)}",
+                request_id=request_id,
+                backend=effective_backend,
+            )
     return app
