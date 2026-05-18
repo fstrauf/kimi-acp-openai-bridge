@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
+from dotenv import load_dotenv
+
+# Load .env file from the project root (where the bridge is started)
+load_dotenv(Path(__file__).parent.parent.parent / ".env")
 
 
 def _get_config_dir() -> Path:
@@ -57,21 +61,26 @@ class BridgeConfig:
     session_timeout: int = 300  # seconds (legacy fallback)
 
     # Prompt size limits (bytes)
-    max_prompt_bytes_direct: int = 20_000
-    max_prompt_bytes_acp: int = 20_000
-    max_prompt_bytes_warning: int = 15_000
+    # Tuned from initial 20 KB defaults based on live PageSeeds evidence:
+    # - reddit_enrich: ~25 KB, CTR audit: ~46 KB, schema renderer: ~75 KB
+    # - Kimi k2.5 context window is 256K tokens (~1 MB), so 100 KB is conservative
+    # - Phase-specific timeouts (90s first content, 300s total) handle ACP stalls
+    max_prompt_bytes_direct: int = 100_000
+    max_prompt_bytes_acp: int = 100_000
+    max_prompt_bytes_warning: int = 80_000
 
     # Concurrency
     max_concurrent_requests: int = 2
 
     # Phase-specific timeouts (seconds)
+    # Tuned for long-form content generation (~160–170s observed in production).
     health_timeout: int = 2
     process_spawn_timeout: int = 10
     acp_initialize_timeout: int = 30
     acp_session_timeout: int = 30
     acp_first_event_timeout: int = 60
-    acp_first_content_timeout: int = 90
-    direct_timeout: int = 120
+    acp_first_content_timeout: int = 150
+    direct_timeout: int = 200
     acp_total_timeout: int = 300
     idle_timeout: int = 60
 
